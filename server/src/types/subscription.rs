@@ -6,7 +6,10 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub(crate) const MAX_LEVELS: usize = 100;
+/// Deepest book a subscription may ask for. Raised from 100 because a client
+/// wants full 1000-level books: at that depth resending the whole snapshot is
+/// 9.6 Mbit/s per coin, which is why `l2Diff` exists.
+pub(crate) const MAX_LEVELS: usize = 1000;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
 /// Hard cap on subscriptions per WS connection. The broadcast hot paths iterate
 /// every subscription on every event, and L4Book subscribes also trigger a
