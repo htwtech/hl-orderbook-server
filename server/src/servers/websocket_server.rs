@@ -1,6 +1,7 @@
 use crate::{
     listeners::order_book::{
-        ActiveL2Params, ActiveSubGuard, ActiveSubs, CoinBbo, InternalMessage, L2FrameCache, L2FrameKey, L2ParamGuard,
+        ActiveL2Params, ActiveSubGuard, ActiveSubs, CoinBbo, InternalMessage, L2DiffFrameCache, L2FrameCache,
+        L2FrameKey, L2ParamGuard,
         L2SnapshotParams, OrderBookListener, hl_listen_hft,
     },
     metrics::{
@@ -11,7 +12,7 @@ use crate::{
     order_book::{Coin, PxBand, Snapshot},
     prelude::*,
     types::{
-        Bbo, L2Book, L4Book, L4BookUpdates, L4Order,
+        Bbo, L2Book, L2Diff, L2SideDiff, L4Book, L4BookUpdates, L4Order,
         inner::InnerLevel,
         subscription::{ClientMessage, DEFAULT_LEVELS, OrderUpdate, ServerResponse, Subscription, SubscriptionManager},
     },
@@ -69,6 +70,19 @@ struct BboEntry {
 /// one silently dropped the other's cache. Validation rejects an explicit
 /// `nLevels == DEFAULT_LEVELS`, so `unwrap_or(DEFAULT_LEVELS)` cannot collide
 /// with an explicit value.
+/// The aggregation shape a subscription needs the listener to compute, if any.
+/// `l2Book` and `l2Diff` share it -- they are the same book, differing only in
+/// whether the whole thing or just the change is put on the wire.
+fn l2_shape_of(sub: &Subscription) -> Option<L2SnapshotParams> {
+    match sub {
+        Subscription::L2Book { n_sig_figs, mantissa, .. }
+        | Subscription::L2Diff { n_sig_figs, mantissa, .. } => {
+            Some(L2SnapshotParams::new(*n_sig_figs, *mantissa))
+        }
+        _ => None,
+    }
+}
+
 fn l2_cache_key(coin: &str, n_sig_figs: Option<u32>, mantissa: Option<u64>, n_levels: Option<usize>) -> String {
     format!(
         "{}:{}:{}:{}",
@@ -380,6 +394,10 @@ async fn handle_socket(
     // listener) whenever the coin set changes.
     // Per-(coin,params) cache for L2 dedup + heartbeat resend (key = "<coin>:<n_sig_figs>:<mantissa>")
     let mut last_l2: HashMap<String, L2Entry> = HashMap::new();
+    // Per-(coin,params,depth) height each l2Diff subscription has been brought
+    // up to. Absent means this connection has not been served a snapshot yet,
+    // so it gets one before any diff could mean anything to it.
+    let mut last_l2_diff: HashMap<String, u64> = HashMap::new();
     // Per-coin cache for BBO dedup + heartbeat resend
     let mut last_bbo: HashMap<String, BboEntry> = HashMap::new();
     // Parsed orderUpdates user addresses, so the hot broadcast path doesn't
@@ -417,6 +435,7 @@ async fn handle_socket(
             &mut manager,
             &mut universe,
             &mut last_l2,
+            &mut last_l2_diff,
             &mut last_bbo,
             &mut user_addrs,
             &active_l2_params,
@@ -456,6 +475,7 @@ async fn run_session(
     manager: &mut SubscriptionManager,
     universe: &mut Arc<HashSet<String>>,
     last_l2: &mut HashMap<String, L2Entry>,
+    last_l2_diff: &mut HashMap<String, u64>,
     last_bbo: &mut HashMap<String, BboEntry>,
     user_addrs: &mut HashMap<String, alloy::primitives::Address>,
     active_l2_params: &ActiveL2Params,
@@ -488,15 +508,21 @@ async fn run_session(
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
-                            InternalMessage::Snapshot{ l2_snapshots, time, dirty, universe: new_universe, l2_frames } => {
+                            InternalMessage::Snapshot{ l2_snapshots, previous, time, height, dirty, universe: new_universe, l2_frames, l2_diff_frames } => {
                                 if let Some(u) = new_universe {
                                     *universe = Arc::clone(u);
                                 }
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
-                                    // Skip BBO subs here - they get fast updates via BboUpdate
-                                    if !matches!(sub, Subscription::Bbo { .. }) {
-                                        alive &= send_ws_data_from_snapshot(outbound, sub, l2_snapshots.as_ref(), *time, last_l2, dirty, force_full_l2, l2_frames, l2_hb.is_some()).await;
+                                    match sub {
+                                        // Skip BBO subs here - they get fast updates via BboUpdate
+                                        Subscription::Bbo { .. } => {}
+                                        Subscription::L2Diff { .. } => {
+                                            alive &= send_ws_data_from_l2_diff(outbound, sub, l2_snapshots.as_ref(), previous.as_ref(), *time, *height, last_l2_diff, dirty, force_full_l2, l2_diff_frames).await;
+                                        }
+                                        _ => {
+                                            alive &= send_ws_data_from_snapshot(outbound, sub, l2_snapshots.as_ref(), *time, last_l2, dirty, force_full_l2, l2_frames, l2_hb.is_some()).await;
+                                        }
                                     }
                                 }
                                 force_full_l2 = false;
@@ -663,7 +689,7 @@ async fn run_session(
                                         alive &= outbound.send_pong();
                                     }
                                     _ => {
-                                        alive &= receive_client_message(outbound, manager, value, universe.as_ref(), listener.clone(), l4_cache, bbo_only, last_l2, last_bbo, active_l2_params, l2_param_guards, active_subs, sub_guards).await;
+                                        alive &= receive_client_message(outbound, manager, value, universe.as_ref(), listener.clone(), l4_cache, bbo_only, last_l2, last_l2_diff, last_bbo, active_l2_params, l2_param_guards, active_subs, sub_guards).await;
                                     }
                                 }
                             }
@@ -705,6 +731,7 @@ async fn receive_client_message(
     l4_cache: &Arc<L4SnapshotCache>,
     bbo_only: bool,
     last_l2: &mut HashMap<String, L2Entry>,
+    last_l2_diff: &mut HashMap<String, u64>,
     last_bbo: &mut HashMap<String, BboEntry>,
     active_l2_params: &ActiveL2Params,
     l2_param_guards: &mut HashMap<L2SnapshotParams, L2ParamGuard>,
@@ -736,9 +763,8 @@ async fn receive_client_message(
                 // per shape per connection (n_levels is a send-time truncation, not
                 // part of the cached shape); the entry API dedups shared shapes.
                 if inserted
-                    && let Subscription::L2Book { n_sig_figs, mantissa, .. } = &subscription
+                    && let Some(params) = l2_shape_of(&subscription)
                 {
-                    let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
                     l2_param_guards.entry(params).or_insert_with(|| active_l2_params.acquire(params));
                 }
                 // Count the subscription's broadcast families as live. MUST
@@ -766,16 +792,25 @@ async fn receive_client_message(
             if removed {
                 sub_guards.remove(&subscription);
                 match &subscription {
-                    Subscription::L2Book { coin, n_sig_figs, mantissa, n_levels } => {
-                        last_l2.remove(&l2_cache_key(coin, *n_sig_figs, *mantissa, *n_levels));
+                    Subscription::L2Book { coin, n_sig_figs, mantissa, n_levels }
+                    | Subscription::L2Diff { coin, n_sig_figs, mantissa, n_levels } => {
+                        let key = l2_cache_key(coin, *n_sig_figs, *mantissa, *n_levels);
+                        if matches!(&subscription, Subscription::L2Diff { .. }) {
+                            last_l2_diff.remove(&key);
+                        } else {
+                            last_l2.remove(&key);
+                        }
                         // Release this connection's guard for the shape only if no
-                        // remaining L2 subscription on this connection still uses it
-                        // (e.g. same shape on another coin / different n_levels).
+                        // remaining L2 subscription on this connection still uses
+                        // it (same shape on another coin, or a different n_levels).
+                        // Both channels share the shape, so both must be consulted:
+                        // dropping the guard while an l2Diff still wants it would
+                        // stop the listener computing it, silently.
                         let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
-                        let still_used = manager.subscriptions().iter().any(|s| {
-                            matches!(s, Subscription::L2Book { n_sig_figs: nsf, mantissa: m, .. }
-                                if L2SnapshotParams::new(*nsf, *m) == params)
-                        });
+                        let still_used = manager
+                            .subscriptions()
+                            .iter()
+                            .any(|s| l2_shape_of(s) == Some(params));
                         if !still_used {
                             l2_param_guards.remove(&params);
                         }
@@ -1072,6 +1107,123 @@ async fn send_ws_data_from_snapshot(
         // else: skip, L2 unchanged
     }
     true
+}
+
+fn serialize_l2_diff(resp: &ServerResponse) -> Option<bytes::Bytes> {
+    match serde_json::to_string(resp) {
+        Ok(json) => Some(bytes::Bytes::from(json)),
+        Err(err) => {
+            error!("l2Diff serialization error: {err}");
+            None
+        }
+    }
+}
+
+/// One `l2Diff` subscription for one flush.
+///
+/// A connection that has not been served yet gets the whole book; after that,
+/// only what moved. When nothing moved inside its depth nothing is sent AND the
+/// recorded height does not advance, so the next update still chains from the
+/// last one the client actually received -- which is exactly what `prevHeight`
+/// promises it can rely on.
+#[allow(clippy::too_many_arguments)]
+async fn send_ws_data_from_l2_diff(
+    outbound: &Outbound,
+    subscription: &Subscription,
+    snapshot: &HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
+    previous: &HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
+    time: u64,
+    height: u64,
+    last_height: &mut HashMap<String, u64>,
+    dirty: &HashSet<Coin>,
+    force_full: bool,
+    diffs: &L2DiffFrameCache,
+) -> bool {
+    let Subscription::L2Diff { coin, n_sig_figs, n_levels, mantissa } = subscription else {
+        return true;
+    };
+    let key = l2_cache_key(coin, *n_sig_figs, *mantissa, *n_levels);
+    let depth = n_levels.unwrap_or(DEFAULT_LEVELS);
+
+    // Truncation has to happen before the comparison: which level falls off the
+    // bottom is a property of the depth that was asked for, so two subscribers
+    // at different depths genuinely see different diffs.
+    let export = |src: &HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>| {
+        src.get(coin.as_str())
+            .and_then(|per_coin| per_coin.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
+            .map(|v| v.truncate(depth).export_inner_snapshot())
+    };
+
+    // Three ways a diff cannot be meant: this connection has never been served,
+    // a broadcast lag left a hole in what it saw, or there is no prior snapshot
+    // to diff against. All three want the whole book.
+    let caught_up = last_height.get(&key).copied();
+    if caught_up.is_none() || force_full || !previous.contains_key(coin.as_str()) {
+        // `previous` only ever holds coins this flush rebuilt, so an established
+        // subscription on a quiet coin lands here every time. It has no news --
+        // resending its book would defeat the entire channel.
+        if caught_up.is_some() && !force_full && !dirty.contains(coin.as_str()) {
+            return true;
+        }
+        let levels = export(snapshot).unwrap_or_else(|| [Vec::new(), Vec::new()]);
+        let resp = ServerResponse::L2Diff(L2Diff::Snapshot {
+            coin: coin.clone(),
+            time,
+            height,
+            n_sig_figs: *n_sig_figs,
+            mantissa: *mantissa,
+            n_levels: Some(depth),
+            levels,
+        });
+        let Some(frame) = serialize_l2_diff(&resp) else {
+            return true;
+        };
+        BROADCASTS_TOTAL.with_label_values(&["l2Diff"]).inc();
+        last_height.insert(key, height);
+        return outbound.send_frame(frame).await;
+    }
+
+    // An untouched coin carries no news.
+    if !dirty.contains(coin.as_str()) {
+        return true;
+    }
+
+    // Truncate, export and compare once per (coin, shape, depth) per broadcast,
+    // shared by every connection wanting the same three.
+    let built = diffs.get_or_build(L2FrameKey::new(coin, *n_sig_figs, *mantissa, depth), || {
+        let old = export(previous)?;
+        // A coin whose book was evicted diffs to nothing: every level goes.
+        let new = export(snapshot).unwrap_or_else(|| [Vec::new(), Vec::new()]);
+        let bids = L2SideDiff::between(&old[0], &new[0]);
+        let asks = L2SideDiff::between(&old[1], &new[1]);
+        if bids.is_empty() && asks.is_empty() {
+            None
+        } else {
+            Some(Arc::new((bids, asks)))
+        }
+    });
+    // The coin changed, but not where this subscriber can see it.
+    let Some(sides) = built else {
+        return true;
+    };
+
+    let resp = ServerResponse::L2Diff(L2Diff::updates(
+        coin.clone(),
+        time,
+        height,
+        caught_up.unwrap_or(height),
+        *n_sig_figs,
+        *mantissa,
+        Some(depth),
+        sides.0.clone(),
+        sides.1.clone(),
+    ));
+    let Some(frame) = serialize_l2_diff(&resp) else {
+        return true;
+    };
+    BROADCASTS_TOTAL.with_label_values(&["l2Diff"]).inc();
+    last_height.insert(key, height);
+    outbound.send_frame(frame).await
 }
 
 impl Subscription {

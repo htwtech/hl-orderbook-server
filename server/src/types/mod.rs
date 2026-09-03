@@ -60,6 +60,136 @@ pub(crate) struct L2Book {
     levels: [Vec<Level>; 2],
 }
 
+/// One level of an `l2Diff` update, as a bare `[px, sz, n]` array.
+///
+/// Deliberately not a `Level` object. Measured on BTC at 1000 levels an update
+/// carries about 45 levels, and spelling the three keys out on each of them
+/// costs some 16 bytes per level -- around 60% of the whole frame. On the one
+/// channel whose entire purpose is fitting inside a client's link, that is not
+/// a rounding error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct L2DiffLevel(String, String, usize);
+
+/// What changed on one side of the book since the previous update.
+///
+/// Keyed by price, not by position: at 1000 levels a new level at the top
+/// shifts every level below it, so a positional diff would degenerate into a
+/// full snapshot on the most ordinary event there is. By price that same event
+/// is one entry in `upd` and one in `del`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct L2SideDiff {
+    /// Levels to insert or overwrite, addressed by price.
+    upd: Vec<L2DiffLevel>,
+    /// Prices no longer in the book at this depth -- cancelled, filled, or
+    /// pushed past `nLevels` by something better.
+    del: Vec<String>,
+}
+
+impl L2SideDiff {
+    /// Diff one side of the book, `old` to `new`, both already truncated to the
+    /// subscriber's depth. Truncation has to come first: which level falls off
+    /// the bottom is a property of the depth that was asked for.
+    pub(crate) fn between(old: &[Level], new: &[Level]) -> Self {
+        let mut prev: std::collections::HashMap<&str, (&str, usize)> =
+            std::collections::HashMap::with_capacity(old.len());
+        for l in old {
+            prev.insert(l.px.as_str(), (l.sz.as_str(), l.n));
+        }
+        let mut upd = Vec::new();
+        for l in new {
+            if prev.remove(l.px.as_str()) != Some((l.sz.as_str(), l.n)) {
+                upd.push(L2DiffLevel(l.px.clone(), l.sz.clone(), l.n));
+            }
+        }
+        // Whatever `new` did not claim is gone from the book at this depth.
+        let del = prev.into_keys().map(str::to_owned).collect();
+        Self { upd, del }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.upd.is_empty() && self.del.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct L2DiffUpdates {
+    coin: String,
+    time: u64,
+    height: u64,
+    /// Height of the previous update sent on this same subscription. A coin is
+    /// not dirty at every block, so heights legitimately skip and `height - 1`
+    /// is no continuity check -- this is. A client whose last applied height
+    /// does not match this has missed an update and needs a fresh snapshot.
+    prev_height: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_sig_figs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mantissa: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    n_levels: Option<usize>,
+    bids: L2SideDiff,
+    asks: L2SideDiff,
+}
+
+/// The `l2Diff` channel: one snapshot when the subscription opens, then only
+/// what changed. Externally tagged like [`L4Book`], so the wire shape is
+/// `{"Snapshot": {..}}` / `{"Updates": {..}}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum L2Diff {
+    #[serde(rename_all = "camelCase")]
+    Snapshot {
+        coin: String,
+        time: u64,
+        height: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        n_sig_figs: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mantissa: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        n_levels: Option<usize>,
+        levels: [Vec<Level>; 2],
+    },
+    Updates(L2DiffUpdates),
+}
+
+impl L2Diff {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn updates(
+        coin: String,
+        time: u64,
+        height: u64,
+        prev_height: u64,
+        n_sig_figs: Option<u32>,
+        mantissa: Option<u64>,
+        n_levels: Option<usize>,
+        bids: L2SideDiff,
+        asks: L2SideDiff,
+    ) -> Self {
+        Self::Updates(L2DiffUpdates {
+            coin,
+            time,
+            height,
+            prev_height,
+            n_sig_figs,
+            mantissa,
+            n_levels,
+            bids,
+            asks,
+        })
+    }
+
+    /// Nothing moved at this depth. The coin was dirty, so the book did change,
+    /// but not within the levels this subscriber can see -- there is nothing to
+    /// send and the client's height stays where it is.
+    pub(crate) fn is_empty_update(&self) -> bool {
+        match self {
+            Self::Updates(u) => u.bids.is_empty() && u.asks.is_empty(),
+            Self::Snapshot { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum L4Book {
     Snapshot { coin: String, time: u64, height: u64, levels: [Vec<L4Order>; 2] },

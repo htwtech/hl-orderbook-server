@@ -159,7 +159,7 @@ impl OrderBookState {
         changed_coins: &HashSet<Coin>,
         active: &HashSet<crate::listeners::order_book::L2SnapshotParams>,
         cache: &mut HashMap<Coin, std::sync::Arc<HashMap<crate::listeners::order_book::L2SnapshotParams, Snapshot<crate::types::inner::InnerLevel>>>>,
-    ) -> (u64, L2Snapshots, HashSet<Coin>, bool) {
+    ) -> (u64, u64, L2Snapshots, HashSet<Coin>, bool) {
         let (snapshots, recomputed, coin_set_changed) =
             crate::listeners::order_book::utils::compute_l2_snapshots_incremental(
                 &self.order_book,
@@ -167,7 +167,7 @@ impl OrderBookState {
                 active,
                 cache,
             );
-        (self.time, snapshots, recomputed, coin_set_changed)
+        (self.time, self.height, snapshots, recomputed, coin_set_changed)
     }
 
     pub(super) fn compute_universe(&self) -> HashSet<Coin> {

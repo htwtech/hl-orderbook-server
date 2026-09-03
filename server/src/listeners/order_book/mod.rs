@@ -869,6 +869,50 @@ impl L2FrameCache {
     }
 }
 
+/// The computed diff for one (coin, shape, depth) in one flush -- bids then
+/// asks -- or `None` when nothing moved inside that depth. The empty case is
+/// common and worth encoding: a dirty coin often changes only below the levels
+/// a shallow subscription can see, and an update with two empty sides would be
+/// pure overhead on the wire.
+///
+/// Only the computation is shared, not a rendered frame. `prevHeight` is a
+/// property of what a given connection last received, so the frame is
+/// serialized per connection -- cheap, since the whole point of the channel is
+/// that these are small.
+pub(crate) type L2DiffBuiltFrame = Option<Arc<(crate::types::L2SideDiff, crate::types::L2SideDiff)>>;
+
+/// Per-broadcast lazy cache of rendered `l2Diff` updates, keyed exactly like
+/// [`L2FrameCache`] -- depth belongs in the key because which level falls off
+/// the bottom depends on it, so two subscribers at different depths genuinely
+/// have different diffs.
+pub(crate) struct L2DiffFrameCache(std::sync::Mutex<rustc_hash::FxHashMap<L2FrameKey, L2DiffBuiltFrame>>);
+
+impl L2DiffFrameCache {
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(rustc_hash::FxHashMap::default()))
+    }
+
+    /// Cached diff for `key`, building on first use. `build` runs outside the
+    /// lock, as in [`L2FrameCache::get_or_build`]; a lost insert race is
+    /// harmless because both builds produce identical bytes.
+    pub(crate) fn get_or_build(
+        &self,
+        key: L2FrameKey,
+        build: impl FnOnce() -> L2DiffBuiltFrame,
+    ) -> L2DiffBuiltFrame {
+        if let Ok(map) = self.0.lock()
+            && let Some(hit) = map.get(&key)
+        {
+            return hit.clone();
+        }
+        let fresh = build();
+        match self.0.lock() {
+            Ok(mut map) => map.entry(key).or_insert(fresh).clone(),
+            Err(_) => fresh,
+        }
+    }
+}
+
 /// Group a fills batch into per-coin trade vectors. Consumes the batch (fills
 /// are never applied to the book), so this is move-only - no event is cloned.
 /// Pairs the two fill legs of each trade match into one public-schema print,
@@ -1315,7 +1359,18 @@ impl OrderBookListener {
             let dirty = std::mem::take(&mut self.pending_dirty_l2_coins);
             L2_CONFLATION_BATCH_SIZE.observe(dirty.len() as f64);
             let l2_start = Instant::now();
-            let (time, l2_snapshots, recomputed, coin_set_changed) =
+            // The l2Diff channel needs the snapshot each rebuild is about to
+            // overwrite, and this is the last moment it still exists. Arc
+            // clones: a handful of refcount bumps, no level data is copied.
+            // Coins with no entry yet are first-time builds -- they owe their
+            // subscribers a snapshot, not a diff, so their absence is correct.
+            let previous = L2Snapshots(
+                dirty
+                    .iter()
+                    .filter_map(|c| self.l2_snapshot_cache.get(c).map(|a| (c.clone(), Arc::clone(a))))
+                    .collect(),
+            );
+            let (time, height, l2_snapshots, recomputed, coin_set_changed) =
                 state.l2_snapshots_incremental(&dirty, &active, &mut self.l2_snapshot_cache);
 
             static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1336,10 +1391,13 @@ impl OrderBookListener {
             if let Some(tx) = &self.internal_message_tx {
                 let msg = Arc::new(InternalMessage::Snapshot {
                     l2_snapshots,
+                    previous,
                     time,
+                    height,
                     dirty: recomputed,
                     universe,
                     l2_frames: L2FrameCache::new(),
+                    l2_diff_frames: L2DiffFrameCache::new(),
                 });
                 drop(tx.send(msg));
             }
@@ -1363,7 +1421,15 @@ impl L2Snapshots {
 pub(crate) enum InternalMessage {
     Snapshot {
         l2_snapshots: L2Snapshots,
+        /// What each rebuilt coin's snapshot looked like before this flush, for
+        /// the `l2Diff` channel to diff against. Present only for coins that
+        /// had a snapshot already.
+        previous: L2Snapshots,
         time: u64,
+        /// Block height this flush reflects. `l2Diff` hangs its continuity
+        /// check on it, and a coin is not dirty at every block, so it is the
+        /// only thing a client can chain updates by.
+        height: u64,
         /// Coins whose snapshots were rebuilt in this flush. Connections skip
         /// L2 subscriptions whose coin is absent (their previously-sent payload
         /// is still current), avoiding per-coin truncate/export/hash work for
@@ -1375,6 +1441,10 @@ pub(crate) enum InternalMessage {
         /// Lazy per-broadcast cache of rendered L2 frames, shared by every
         /// connection (see [`L2FrameCache`]).
         l2_frames: L2FrameCache,
+        /// The same idea as `l2_frames`, for the diff channel: the first
+        /// connection wanting a given (coin, shape, depth) pays for the diff,
+        /// every other one reuses it.
+        l2_diff_frames: L2DiffFrameCache,
     },
     /// Trades grouped per coin ONCE in the listener; connections share the
     /// Arc'd vectors AND the lazily-serialized wire frame per coin.

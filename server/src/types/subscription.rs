@@ -1,6 +1,6 @@
 use crate::metrics::WS_SUBSCRIPTIONS_ACTIVE;
 use crate::types::node_data::{NodeDataOrderDiff, NodeDataOrderStatus};
-use crate::types::{Bbo, L2Book, L4Book, Trade};
+use crate::types::{Bbo, L2Book, L2Diff, L4Book, Trade};
 use alloy::primitives::Address;
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,11 @@ pub(crate) enum Subscription {
     Trades { coin: String },
     #[serde(rename_all = "camelCase")]
     L2Book { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
+    /// The same book, the same parameters, but sent as one snapshot followed by
+    /// only what changed. Measured on BTC at 1000 levels this is some 66x less
+    /// traffic than resending the snapshot; see `types::L2Diff`.
+    #[serde(rename_all = "camelCase")]
+    L2Diff { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
     #[serde(rename_all = "camelCase")]
     L4Book { coin: String },
     #[serde(rename_all = "camelCase")]
@@ -46,7 +51,8 @@ impl Subscription {
     pub(crate) fn validate(&self, universe: &HashSet<String>) -> bool {
         match self {
             Self::Trades { coin } => universe.contains(coin),
-            Self::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
+            Self::L2Book { coin, n_sig_figs, n_levels, mantissa }
+            | Self::L2Diff { coin, n_sig_figs, n_levels, mantissa } => {
                 if !universe.contains(coin) {
                     debug!("Invalid subscription: coin not found");
                     return false;
@@ -107,6 +113,7 @@ impl Subscription {
         match self {
             Self::Bbo { .. } => "bbo",
             Self::L2Book { .. } => "l2Book",
+            Self::L2Diff { .. } => "l2Diff",
             Self::L4Book { .. } => "l4Book",
             Self::Trades { .. } => "trades",
             Self::OrderUpdates { .. } => "orderUpdates",
@@ -137,6 +144,7 @@ impl OrderUpdate {
 pub(crate) enum ServerResponse {
     SubscriptionResponse(ClientMessage),
     L2Book(L2Book),
+    L2Diff(L2Diff),
     L4Book(L4Book),
     Trades(std::sync::Arc<Vec<Trade>>),
     Bbo(Bbo),
