@@ -1579,8 +1579,8 @@ impl ActiveSubCounts {
 }
 
 impl ActiveSubs {
-    /// Guards for every broadcast family `sub` consumes (empty for l2Book,
-    /// which is gated separately via [`ActiveL2Params`]). Connections MUST
+    /// Guards for every broadcast family `sub` consumes (empty for l2Book and
+    /// l2Diff, gated separately via [`ActiveL2Params`]). Connections MUST
     /// acquire before capturing the subscription's immediate snapshot, so the
     /// event stream is already flowing when the snapshot is taken and no
     /// update can fall in the gap between them; guards are released via Drop
@@ -1594,7 +1594,9 @@ impl ActiveSubs {
             Subscription::BookDiffs { .. } => vec![self.acquire(BroadcastKind::L4Diffs)],
             Subscription::Trades { .. } => vec![self.acquire(BroadcastKind::Trades)],
             Subscription::Bbo { .. } => vec![self.acquire(BroadcastKind::Bbo)],
-            Subscription::L2Book { .. } => Vec::new(),
+            // Both L2 channels are the same book off the same flush, so both
+            // hold a shape guard instead of a broadcast-family one.
+            Subscription::L2Book { .. } | Subscription::L2Diff { .. } => Vec::new(),
         }
     }
 

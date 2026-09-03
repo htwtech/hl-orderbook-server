@@ -355,13 +355,18 @@ mod test {
 
     #[test]
     fn test_validate_l2book_n_levels_over_max() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(101), mantissa: None };
+        // Against the constant, not a copy of its value: these tests were
+        // written when the cap was 100 and silently became wrong the moment it
+        // moved.
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(MAX_LEVELS + 1), mantissa: None };
         assert!(!sub.validate(&universe()));
     }
 
     #[test]
     fn test_validate_l2book_n_levels_at_max() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(100), mantissa: None };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(MAX_LEVELS), mantissa: None };
         assert!(sub.validate(&universe()));
     }
 
