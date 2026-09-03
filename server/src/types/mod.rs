@@ -178,16 +178,6 @@ impl L2Diff {
             asks,
         })
     }
-
-    /// Nothing moved at this depth. The coin was dirty, so the book did change,
-    /// but not within the levels this subscriber can see -- there is nothing to
-    /// send and the client's height stays where it is.
-    pub(crate) fn is_empty_update(&self) -> bool {
-        match self {
-            Self::Updates(u) => u.bids.is_empty() && u.asks.is_empty(),
-            Self::Snapshot { .. } => false,
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
