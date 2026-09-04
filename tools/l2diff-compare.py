@@ -27,6 +27,7 @@ Standard library only, so it runs on the node with nothing installed.
 
 import argparse
 import base64
+import collections
 import json
 import os
 import socket
@@ -38,6 +39,11 @@ import time as _time
 from urllib.parse import urlparse
 
 DEFAULT_LEVELS = 20
+
+# Whole books kept per node so a disagreement can be measured, not just
+# detected. Bounded because a 1000-level book is a few hundred KB in Python and
+# a minute's run reaches several hundred heights.
+SAMPLE_KEEP = 120
 
 
 class Ws:
@@ -158,14 +164,46 @@ def book_signature(book):
     )
 
 
+def compare_books(a, b):
+    """How far apart two books are: (levels differing, their depth ranks).
+
+    The rank matters as much as the count. Disagreement at the bottom is churn
+    around the nLevels boundary and benign; disagreement near the top would mean
+    the nodes see a different market.
+    """
+    differing, ranks = 0, []
+    for side, (sa, sb) in enumerate(zip(a, b)):
+        # Bids run best-first descending, asks best-first ascending.
+        order = sorted(set(sa) | set(sb), key=float, reverse=(side == 0))
+        for rank, px in enumerate(order):
+            if sa.get(px) != sb.get(px):
+                differing += 1
+                ranks.append(rank)
+    return differing, ranks
+
+
+def quantile(values, q):
+    if not values:
+        return 0
+    s = sorted(values)
+    return s[min(len(s) - 1, int(round(q * (len(s) - 1))))]
+
+
 class NodeStream(threading.Thread):
     def __init__(self, name, url, sub, token, deadline):
         super().__init__(daemon=True)
         self.name, self.url, self.sub, self.token, self.deadline = name, url, sub, token, deadline
         self.intervals = {}     # (prevHeight, height) -> content signature
         self.books = {}         # height -> book signature after applying up to it
+        self.samples = collections.OrderedDict()  # height -> whole book, last SAMPLE_KEEP
         self.snapshots = self.updates = 0
         self.error = None
+
+    def _record(self, height, book):
+        self.books[height] = book_signature(book)
+        self.samples[height] = [dict(book[0]), dict(book[1])]
+        while len(self.samples) > SAMPLE_KEEP:
+            self.samples.popitem(last=False)
 
     def run(self):
         try:
@@ -188,7 +226,7 @@ class NodeStream(threading.Thread):
                     d = data["Snapshot"]
                     book, have = book_from_levels(d["levels"]), True
                     self.snapshots += 1
-                    self.books[d["height"]] = book_signature(book)
+                    self._record(d["height"], book)
                 else:
                     d = data["Updates"]
                     self.updates += 1
@@ -200,7 +238,7 @@ class NodeStream(threading.Thread):
                     )
                     apply_side(book[0], d["bids"])
                     apply_side(book[1], d["asks"])
-                    self.books[d["height"]] = book_signature(book)
+                    self._record(d["height"], book)
         except Exception as e:  # a dead node must not take the other one with it
             self.error = "{}: {}".format(type(e).__name__, e)
 
@@ -275,15 +313,48 @@ def main():
     print("--- 3. at a height both reached, are the BOOKS identical? ---")
     if common:
         print("identical {} of {}  ({:.1f}%)".format(agree, len(common), pct(agree, len(common))))
-        for h in common:
-            if a.books[h] != b.books[h]:
-                print("  first disagreement at height {}".format(h))
-                break
     else:
         print("no height reached by both -- nothing to compare")
 
+    # How far apart, on the heights whose whole books we still hold. This is
+    # what separates a timing artefact from the nodes genuinely disagreeing.
+    sampled = sorted(set(a.samples) & set(b.samples))
+    counts, all_ranks, depth = [], [], 0
+    for h in sampled:
+        n, ranks = compare_books(a.samples[h], b.samples[h])
+        counts.append(n)
+        all_ranks.extend(ranks)
+        depth = max(depth, len(a.samples[h][0]) + len(a.samples[h][1]))
+    if sampled:
+        print("")
+        print("--- how far apart, over {} sampled heights ---".format(len(sampled)))
+        print("levels differing: median {}, p95 {}, max {}   (of {} in the book)"
+              .format(quantile(counts, 0.5), quantile(counts, 0.95), max(counts), depth))
+        if all_ranks:
+            print("their depth rank: median {}, p95 {}, max {}   (0 = best price)"
+                  .format(quantile(all_ranks, 0.5), quantile(all_ranks, 0.95), max(all_ranks)))
+
     print("")
     print("--- what this means ---")
+    if sampled and counts:
+        med, half = quantile(counts, 0.5), depth // 2
+        near_top = quantile(all_ranks, 0.5) < depth // 8 if all_ranks else False
+        if med == 0:
+            pass
+        elif med > half:
+            print("The books differ across most of their depth. That is not timing:")
+            print("the nodes are holding different books. Stop and find out why")
+            print("before any of this is built on.")
+        elif near_top:
+            print("Few levels differ, but they sit near the top of the book, where")
+            print("a stale price is worth the most. Worth understanding before")
+            print("treating this as harmless timing.")
+        else:
+            print("Few levels differ and they sit deep in the book -- the signature")
+            print("of snapshots taken at different moments WITHIN a block, not of")
+            print("nodes disagreeing. `height` currently marks a point inside the")
+            print("block's application, not its end; per-block emission is what")
+            print("would make it a real checkpoint.")
     if common and agree == len(common):
         print("The books agree at every height both nodes reached. wsarb can move")
         print("from one node to the other at any such height and carry on applying")
