@@ -174,6 +174,44 @@ def quantile(values, q):
     return s[min(len(s) - 1, int(round(q * (len(s) - 1))))]
 
 
+def book_signature(book):
+    """Order-independent identity of a whole book."""
+    return (tuple(sorted(book[0].items())), tuple(sorted(book[1].items())))
+
+
+def top_n(book, n):
+    """The best n levels a side, in price order."""
+    out = []
+    for side, s in enumerate(book):
+        keep = sorted(s, key=float, reverse=(side == 0))[:n]
+        out.append({px: s[px] for px in keep})
+    return out
+
+
+def difference_kinds(a, b):
+    """What KIND of disagreement each differing level is.
+
+    A price one node has and the other does not is the truncation boundary and
+    ordering. The same price carrying a different size means the nodes do not
+    agree on what is resting there, which is a different and much worse thing.
+    """
+    kinds = collections.Counter()
+    for sa, sb in zip(a, b):
+        for px in set(sa) | set(sb):
+            va, vb = sa.get(px), sb.get(px)
+            if va == vb:
+                continue
+            if va is None:
+                kinds["price only in B"] += 1
+            elif vb is None:
+                kinds["price only in A"] += 1
+            elif va[0] != vb[0]:
+                kinds["same price, different sz"] += 1
+            else:
+                kinds["same price and sz, different n"] += 1
+    return kinds
+
+
 class NodeStream(threading.Thread):
     def __init__(self, name, url, sub, token, deadline):
         super().__init__(daemon=True)
@@ -182,11 +220,15 @@ class NodeStream(threading.Thread):
         self.intervals = {}     # l2Diff only: (prevHeight, height) -> signature
         self.samples = collections.OrderedDict()   # key -> whole book
         self.keys = set()       # every key seen, even once the book is evicted
+        self.sigs = {}          # key -> book signature, kept for the whole run
         self.frames = 0
         self.error = None
 
     def _record(self, key, book):
         self.keys.add(key)
+        # The signature is small, so it is kept for every key; whole books are
+        # only worth holding for a window.
+        self.sigs[key] = book_signature(book)
         self.samples[key] = [dict(book[0]), dict(book[1])]
         while len(self.samples) > SAMPLE_KEEP:
             self.samples.popitem(last=False)
@@ -319,6 +361,56 @@ def main():
         print("their depth rank:  median {}, p95 {}, max {}   (0 = best price, {} per side)".format(
             quantile(all_ranks, 0.5), quantile(all_ranks, 0.95), max(all_ranks), per_side))
         print("in the deepest quarter of the book: {:.1f}% of them".format(pct(deep, len(all_ranks))))
+
+    # The decisive question. If the nodes hold the same book and merely sample
+    # it at different moments inside a block, then a book one of them produced
+    # must turn up EXACTLY in the other's stream -- just under a different key.
+    # If it never does, at any offset, they really are holding different books.
+    #
+    # This matters because the comparison above cannot tell those apart: one
+    # node alone emits several distinct books under a single `time` (it dedups
+    # by content before sending, so two frames sharing a stamp necessarily
+    # differ), which means `time` does not identify a state to compare at.
+    sa, sb = set(a.sigs.values()), set(b.sigs.values())
+    both = sa & sb
+    print("")
+    print("--- does either node's book ever appear in the other's stream? ---")
+    print("A produced {} distinct books, B {}".format(len(sa), len(sb)))
+    if both:
+        print("{} are the same book: {:.1f}% of A's, {:.1f}% of B's".format(
+            len(both), pct(len(both), len(sa)), pct(len(both), len(sb))))
+        by_sig_b = {}
+        for k, sig in b.sigs.items():
+            by_sig_b.setdefault(sig, []).append(k)
+        offsets = [min(abs(k - kb) for kb in by_sig_b[sig])
+                   for k, sig in a.sigs.items() if sig in by_sig_b]
+        if offsets:
+            print("gap between the two sightings ({}): median {}, p95 {}, max {}".format(
+                keyed_by, quantile(offsets, 0.5), quantile(offsets, 0.95), max(offsets)))
+    else:
+        print("Not one, at any offset.")
+
+    # Where the disagreement sits. wsarb serves 20 levels by default, so one
+    # confined to the tail costs production nothing.
+    print("")
+    print("--- agreement by depth ---")
+    per_side = max(1, depth // 2)
+    for n in sorted({d for d in (5, 10, 20, 50, 100, per_side) if d <= per_side}):
+        same = sum(1 for k in sampled if top_n(a.samples[k], n) == top_n(b.samples[k], n))
+        print("  top {:>4} a side: {:>4} of {} identical  ({:.1f}%)".format(
+            n, same, len(sampled), pct(same, len(sampled))))
+
+    # A price one node lacks is the truncation boundary and ordering. The same
+    # price carrying a different size is not.
+    kinds = collections.Counter()
+    for k in sampled:
+        kinds += difference_kinds(a.samples[k], b.samples[k])
+    total_k = sum(kinds.values())
+    if total_k:
+        print("")
+        print("--- what kind of disagreement ---")
+        for kind, n in kinds.most_common():
+            print("  {:>34}: {:>7}  ({:.1f}%)".format(kind, n, pct(n, total_k)))
 
     # No prose verdict here on purpose. An earlier version of this script picked
     # thresholds, called 567 differing levels out of 2000 "few", and printed two
