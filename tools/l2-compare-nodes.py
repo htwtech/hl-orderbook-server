@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
-"""Do two nodes produce interchangeable l2Diff updates?
+"""Do two nodes hold the same book?
 
-Subscribes to `l2Diff` on two nodes for the same coin with the same parameters,
-and answers three questions in increasing order of usefulness.
+Subscribes to the same coin with the same parameters on two nodes and compares
+what they report, either channel:
 
-1. Do the INTERVALS line up? Each update covers prevHeight -> height. The nodes
-   flush on their own 50 ms phase, so one may send 100->103 where the other
-   sends 102->103. Frames whose intervals differ are not comparable at all, and
-   a proxy could never splice them frame for frame.
+  --channel l2Book   each frame IS a book; compared at equal `time`
+  --channel l2Diff   the book is rebuilt from the updates; compared at equal `height`
 
-2. Where an interval IS shared, is the CONTENT identical? If not, the two nodes
-   disagree about the book itself, which would be a much deeper problem than
-   timing.
+Run l2Book first. It involves nothing this repository recently added, so it
+separates "the nodes disagree" from "the diff channel loses something" -- and
+those want completely different investigations.
 
-3. At heights both nodes reached, are the BOOKS identical? This is the one that
-   decides the design. Intervals can differ freely and it still does not matter:
-   if the reconstructed books agree at a shared height, a proxy can switch from
-   one node to the other at that height and simply carry on applying updates --
-   no snapshot, no gap, nothing for the client to notice.
+For l2Diff it also reports whether the update INTERVALS (prevHeight -> height)
+line up at all, since the nodes flush on their own 50 ms phase.
 
 Standard library only, so it runs on the node with nothing installed.
 
-  python3 l2diff-compare.py --a ws://localhost:48001/ws --b ws://localhost:48002/ws \
-      --coin BTC --levels 1000 --seconds 60
+  python3 l2-compare-nodes.py --channel l2Book --coin BTC --levels 1000 --seconds 60
 """
 
 import argparse
@@ -41,8 +35,7 @@ from urllib.parse import urlparse
 DEFAULT_LEVELS = 20
 
 # Whole books kept per node so a disagreement can be measured, not just
-# detected. Bounded because a 1000-level book is a few hundred KB in Python and
-# a minute's run reaches several hundred heights.
+# detected. Bounded: a 1000-level book is a few hundred KB in Python.
 SAMPLE_KEEP = 120
 
 
@@ -156,20 +149,12 @@ def side_signature(diff):
     )
 
 
-def book_signature(book):
-    """Order-independent identity of a whole reconstructed book."""
-    return (
-        tuple(sorted(book[0].items())),
-        tuple(sorted(book[1].items())),
-    )
-
-
 def compare_books(a, b):
     """How far apart two books are: (levels differing, their depth ranks).
 
-    The rank matters as much as the count. Disagreement at the bottom is churn
-    around the nLevels boundary and benign; disagreement near the top would mean
-    the nodes see a different market.
+    The rank matters as much as the count. Disagreement only at the bottom is
+    churn around the nLevels boundary; disagreement spread through the depth,
+    or sitting at the top, means something else.
     """
     differing, ranks = 0, []
     for side, (sa, sb) in enumerate(zip(a, b)):
@@ -193,15 +178,16 @@ class NodeStream(threading.Thread):
     def __init__(self, name, url, sub, token, deadline):
         super().__init__(daemon=True)
         self.name, self.url, self.sub, self.token, self.deadline = name, url, sub, token, deadline
-        self.intervals = {}     # (prevHeight, height) -> content signature
-        self.books = {}         # height -> book signature after applying up to it
-        self.samples = collections.OrderedDict()  # height -> whole book, last SAMPLE_KEEP
-        self.snapshots = self.updates = 0
+        self.channel = sub["type"]
+        self.intervals = {}     # l2Diff only: (prevHeight, height) -> signature
+        self.samples = collections.OrderedDict()   # key -> whole book
+        self.keys = set()       # every key seen, even once the book is evicted
+        self.frames = 0
         self.error = None
 
-    def _record(self, height, book):
-        self.books[height] = book_signature(book)
-        self.samples[height] = [dict(book[0]), dict(book[1])]
+    def _record(self, key, book):
+        self.keys.add(key)
+        self.samples[key] = [dict(book[0]), dict(book[1])]
         while len(self.samples) > SAMPLE_KEEP:
             self.samples.popitem(last=False)
 
@@ -219,17 +205,23 @@ class NodeStream(threading.Thread):
                 if msg.get("channel") == "error":
                     self.error = str(msg.get("data"))
                     return
-                if msg.get("channel") != "l2Diff":
+                if msg.get("channel") != self.channel:
                     continue
+                self.frames += 1
                 data = msg["data"]
+
+                if self.channel == "l2Book":
+                    # Each frame is already the whole book; `time` is the only
+                    # key both nodes derive from the same place.
+                    self._record(data["time"], book_from_levels(data["levels"]))
+                    continue
+
                 if "Snapshot" in data:
                     d = data["Snapshot"]
                     book, have = book_from_levels(d["levels"]), True
-                    self.snapshots += 1
                     self._record(d["height"], book)
                 else:
                     d = data["Updates"]
-                    self.updates += 1
                     if not have:
                         continue
                     self.intervals[(d["prevHeight"], d["height"])] = (
@@ -249,6 +241,7 @@ def pct(n, d):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--channel", choices=("l2Book", "l2Diff"), default="l2Book")
     ap.add_argument("--a", default="ws://localhost:48001/ws")
     ap.add_argument("--b", default="ws://localhost:48002/ws")
     ap.add_argument("--coin", default="BTC")
@@ -258,16 +251,17 @@ def main():
     ap.add_argument("--token", default=None)
     args = ap.parse_args()
 
-    sub = {"type": "l2Diff", "coin": args.coin}
+    sub = {"type": args.channel, "coin": args.coin}
     if args.levels != DEFAULT_LEVELS:
         sub["nLevels"] = args.levels
     if args.sig_figs is not None:
         sub["nSigFigs"] = args.sig_figs
+    keyed_by = "time" if args.channel == "l2Book" else "height"
 
     deadline = _time.time() + args.seconds
     a = NodeStream("A", args.a, sub, args.token, deadline)
     b = NodeStream("B", args.b, sub, args.token, deadline)
-    print("comparing l2Diff {} for {:.0f}s".format(json.dumps(sub), args.seconds))
+    print("comparing {} for {:.0f}s, keyed by {}".format(json.dumps(sub), args.seconds, keyed_by))
     print("  A: {}\n  B: {}".format(args.a, args.b))
     a.start()
     b.start()
@@ -281,93 +275,54 @@ def main():
         return 1
 
     print("")
-    print("A: {} snapshot(s), {} update(s)".format(a.snapshots, a.updates))
-    print("B: {} snapshot(s), {} update(s)".format(b.snapshots, b.updates))
+    print("A: {} frame(s), {} distinct {}".format(a.frames, len(a.keys), keyed_by))
+    print("B: {} frame(s), {} distinct {}".format(b.frames, len(b.keys), keyed_by))
 
-    # 1. intervals
-    ia, ib = set(a.intervals), set(b.intervals)
-    shared = ia & ib
+    if args.channel == "l2Diff":
+        ia, ib = set(a.intervals), set(b.intervals)
+        shared = ia & ib
+        same = sum(1 for k in shared if a.intervals[k] == b.intervals[k])
+        print("")
+        print("--- update intervals ---")
+        print("A {}, B {}, shared {}  ({:.1f}% of A)".format(
+            len(ia), len(ib), len(shared), pct(len(shared), len(ia))))
+        if shared:
+            print("content identical on {} of {} shared  ({:.1f}%)".format(
+                same, len(shared), pct(same, len(shared))))
+
+    common_keys = sorted(a.keys & b.keys)
     print("")
-    print("--- 1. do the intervals line up? ---")
-    print("A had {}, B had {}, shared {}  ({:.1f}% of A, {:.1f}% of B)"
-          .format(len(ia), len(ib), len(shared), pct(len(shared), len(ia)), pct(len(shared), len(ib))))
+    print("--- books at the same {} ---".format(keyed_by))
+    print("{} in common".format(len(common_keys)))
 
-    # 2. content on shared intervals
-    same = sum(1 for k in shared if a.intervals[k] == b.intervals[k])
-    print("")
-    print("--- 2. on a shared interval, is the content identical? ---")
-    if shared:
-        print("identical {} of {}  ({:.1f}%)".format(same, len(shared), pct(same, len(shared))))
-        for k in sorted(shared):
-            if a.intervals[k] != b.intervals[k]:
-                print("  first disagreement at {} -> {}".format(k[0], k[1]))
-                break
-    else:
-        print("no shared interval to compare -- the nodes never cut the same way")
-
-    # 3. books at common heights: the one that decides the design
-    ha, hb = set(a.books), set(b.books)
-    common = sorted(ha & hb)
-    agree = sum(1 for h in common if a.books[h] == b.books[h])
-    print("")
-    print("--- 3. at a height both reached, are the BOOKS identical? ---")
-    if common:
-        print("identical {} of {}  ({:.1f}%)".format(agree, len(common), pct(agree, len(common))))
-    else:
-        print("no height reached by both -- nothing to compare")
-
-    # How far apart, on the heights whose whole books we still hold. This is
-    # what separates a timing artefact from the nodes genuinely disagreeing.
     sampled = sorted(set(a.samples) & set(b.samples))
-    counts, all_ranks, depth = [], [], 0
-    for h in sampled:
-        n, ranks = compare_books(a.samples[h], b.samples[h])
+    if not sampled:
+        print("none of them still held for comparison -- raise SAMPLE_KEEP or")
+        print("shorten the run")
+        return 1
+
+    counts, all_ranks, depth, identical = [], [], 0, 0
+    for k in sampled:
+        n, ranks = compare_books(a.samples[k], b.samples[k])
         counts.append(n)
         all_ranks.extend(ranks)
-        depth = max(depth, len(a.samples[h][0]) + len(a.samples[h][1]))
-    if sampled:
-        print("")
-        print("--- how far apart, over {} sampled heights ---".format(len(sampled)))
-        print("levels differing: median {}, p95 {}, max {}   (of {} in the book)"
-              .format(quantile(counts, 0.5), quantile(counts, 0.95), max(counts), depth))
-        if all_ranks:
-            print("their depth rank: median {}, p95 {}, max {}   (0 = best price)"
-                  .format(quantile(all_ranks, 0.5), quantile(all_ranks, 0.95), max(all_ranks)))
+        depth = max(depth, len(a.samples[k][0]) + len(a.samples[k][1]))
+        identical += n == 0
 
-    print("")
-    print("--- what this means ---")
-    if sampled and counts:
-        med, half = quantile(counts, 0.5), depth // 2
-        near_top = quantile(all_ranks, 0.5) < depth // 8 if all_ranks else False
-        if med == 0:
-            pass
-        elif med > half:
-            print("The books differ across most of their depth. That is not timing:")
-            print("the nodes are holding different books. Stop and find out why")
-            print("before any of this is built on.")
-        elif near_top:
-            print("Few levels differ, but they sit near the top of the book, where")
-            print("a stale price is worth the most. Worth understanding before")
-            print("treating this as harmless timing.")
-        else:
-            print("Few levels differ and they sit deep in the book -- the signature")
-            print("of snapshots taken at different moments WITHIN a block, not of")
-            print("nodes disagreeing. `height` currently marks a point inside the")
-            print("block's application, not its end; per-block emission is what")
-            print("would make it a real checkpoint.")
-    if common and agree == len(common):
-        print("The books agree at every height both nodes reached. wsarb can move")
-        print("from one node to the other at any such height and carry on applying")
-        print("updates: no snapshot, no gap, nothing the client can see. Per-block")
-        print("emission would buy nothing.")
-    elif common and pct(agree, len(common)) < 100:
-        print("The books DIVERGE at heights both nodes reached. That is not a")
-        print("timing artefact -- the nodes disagree about the book itself, and")
-        print("switching sources mid-stream would corrupt the client. Investigate")
-        print("before building any failover on top of this channel.")
-    if shared and same < len(shared):
-        print("Shared intervals with differing content point the same way: check")
-        print("whether one node is behind on ingest rather than merely out of phase.")
+    print("compared {}, identical {}  ({:.1f}%)".format(
+        len(sampled), identical, pct(identical, len(sampled))))
+    print("levels differing: median {}, p95 {}, max {}   (of {} in the book)".format(
+        quantile(counts, 0.5), quantile(counts, 0.95), max(counts), depth))
+    if all_ranks:
+        per_side = max(1, depth // 2)
+        deep = sum(1 for r in all_ranks if r > per_side * 3 // 4)
+        print("their depth rank:  median {}, p95 {}, max {}   (0 = best price, {} per side)".format(
+            quantile(all_ranks, 0.5), quantile(all_ranks, 0.95), max(all_ranks), per_side))
+        print("in the deepest quarter of the book: {:.1f}% of them".format(pct(deep, len(all_ranks))))
+
+    # No prose verdict here on purpose. An earlier version of this script picked
+    # thresholds, called 567 differing levels out of 2000 "few", and printed two
+    # contradictory conclusions in a row. The numbers above say it better.
     return 0
 
 
