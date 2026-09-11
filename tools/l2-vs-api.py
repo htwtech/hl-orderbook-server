@@ -18,6 +18,12 @@ Beyond how far apart the books are, this reports which way: on how many levels
 we show MORE than the reference, and on how many less. Phantom orders -- ones
 we still hold after the chain removed them -- push that balance one way only.
 
+Prices and sizes are compared as numbers, not strings: two servers can spell
+the same price "110503" and "110503.0", and keyed on the string every level
+comes out "only in ours" and "only in ref" at once -- which is exactly what the
+first run against the public API produced. The raw strings are still shown,
+once, so a spelling difference is seen rather than silently absorbed.
+
 Standard library only.
 
   python3 l2-vs-api.py --coin BTC --seconds 120
@@ -35,6 +41,7 @@ import struct
 import sys
 import threading
 import time as _time
+from decimal import Decimal
 from urllib.parse import urlparse
 
 DEFAULT_LEVELS = 20
@@ -125,7 +132,20 @@ class Ws:
 
 
 def book_from_levels(levels):
-    return [{lv["px"]: (lv["sz"], lv["n"]) for lv in side} for side in levels]
+    # Decimal, not the wire string and not float: Decimal("110503.0") equals
+    # Decimal("110503") and hashes the same, so differently spelled prices land
+    # on one key, while 0.1 stays exact.
+    return [{Decimal(lv["px"]): (Decimal(lv["sz"]), lv["n"]) for lv in side} for side in levels]
+
+
+def wire_sample(levels):
+    """The best level of each side as it came off the wire, unparsed."""
+    def one(side):
+        if not side:
+            return "-"
+        lv = side[0]
+        return "{} x {} (n {})".format(lv["px"], lv["sz"], lv["n"])
+    return "bid {}   ask {}".format(one(levels[0]), one(levels[1]))
 
 
 def top_n(book, n):
@@ -150,7 +170,7 @@ def compare(ours, ref):
             # A level only we have, or a bigger size, or the same size with more
             # orders on it: we show more resting interest than the reference.
             # Anything else is the reference showing more.
-            if vb is None or (va is not None and (float(va[0]), va[1]) > (float(vb[0]), vb[1])):
+            if vb is None or (va is not None and va > vb):
                 ours_more += 1
             else:
                 ref_more += 1
@@ -196,6 +216,7 @@ class Stream(threading.Thread):
         self.name, self.url, self.sub, self.deadline, self.on_frame = name, url, sub, deadline, on_frame
         self.frames = 0
         self.error = None
+        self.sample = None   # the first frame's best levels, verbatim
 
     def run(self):
         try:
@@ -214,6 +235,8 @@ class Stream(threading.Thread):
                     continue
                 self.frames += 1
                 d = msg["data"]
+                if self.sample is None:
+                    self.sample = wire_sample(d["levels"])
                 self.on_frame(d["time"], book_from_levels(d["levels"]))
         except Exception as e:
             self.error = "{}: {}".format(type(e).__name__, e)
@@ -261,7 +284,7 @@ def main():
     ours.start()
     ref.start()
 
-    st = dict(matched=0, identical=0, unmatched=0, more_ours=0, more_ref=0, depth=0)
+    st = dict(matched=0, identical=0, unmatched=0, more_ours=0, more_ref=0, depth=0, shared=0)
     counts, all_ranks = [], []
     top_ok, top_seen = collections.Counter(), collections.Counter()   # per depth: only matches deep enough count
     all_kinds = collections.Counter()
@@ -298,7 +321,15 @@ def main():
             differing, ranks, om, rm, o, r, n = best
             total = n[0] + n[1]
             st["depth"] = max(st["depth"], total)
+            # Shown once, before the first verdict: the spelling of price and
+            # size on each side, as received. Comparison is numeric, so a
+            # difference here is absorbed -- but it should be seen, not hidden.
+            if st["matched"] == 0:
+                print("wire sample   ours: {}\n              ref:  {}\n".format(ours.sample, ref.sample))
             st["matched"] += 1
+            # Matches with at least one price on both sides. None at all across
+            # a run means the books are not two views of one market.
+            st["shared"] += any(set(o[i]) & set(r[i]) for i in (0, 1))
             counts.append(differing)
             all_ranks.extend(ranks)
             st["more_ours"] += om
@@ -340,6 +371,9 @@ def main():
         return 1
     print("levels differing: median {}, p95 {}, max {}   (of up to {} compared)".format(
         quantile(counts, 0.5), quantile(counts, 0.95), max(counts), st["depth"]))
+    if st["shared"] == 0:
+        print("no price appears on both sides in any match -- not a book divergence; "
+              "check the coin and aggregation, see the wire sample")
     for k in (5, 20):
         if top_seen[k]:
             print("top {:>2} a side identical: {} of {}  ({:.1f}%)".format(
