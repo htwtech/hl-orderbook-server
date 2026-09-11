@@ -38,7 +38,7 @@ import time as _time
 from urllib.parse import urlparse
 
 DEFAULT_LEVELS = 20
-RING = 300          # our frames kept, keyed by block time; ~20 s at 15/s
+RING = 300          # block times kept on our side; ~20 s at 15/s
 
 
 class Ws:
@@ -236,12 +236,17 @@ def main():
         sub["nLevels"] = args.levels
 
     lock = threading.Lock()
-    ring = collections.OrderedDict()      # our frames: time -> book
+    # Our frames, keyed by block time -- a LIST per time, not one book. A source
+    # flushes more than once inside a block, each flush a different state under
+    # the same stamp, and keeping only the last one made the control run (our
+    # source against itself) come out 78% identical: the reference's first
+    # flush of a block was being held against our second.
+    ring = collections.OrderedDict()      # time -> [book, book, ...]
     pending = collections.deque()         # reference frames awaiting a match: (time, book, arrived_at)
 
     def on_ours(t, book):
         with lock:
-            ring[t] = book
+            ring.setdefault(t, []).append(book)
             while len(ring) > RING:
                 ring.popitem(last=False)
 
@@ -268,23 +273,31 @@ def main():
         for item in items:
             t, rbook, arrived = item
             with lock:
-                obook = ring.get(t)
-                if obook is None and not (final or now - arrived > args.wait):
+                candidates = list(ring.get(t) or [])
+                if not candidates and not (final or now - arrived > args.wait):
                     continue
                 pending.remove(item)
-            if obook is None:
+            if not candidates:
                 st["unmatched"] += 1
                 print("{}  no frame at this time on our side".format(hhmmss(t)))
                 continue
 
-            # Compare at the depth both sides have.
-            n = [min(len(obook[i]), len(rbook[i])) for i in (0, 1)]
-            o = [top_n(obook, n[0])[0], top_n(obook, n[1])[1]]
-            r = [top_n(rbook, n[0])[0], top_n(rbook, n[1])[1]]
+            # Within one block our source passes through several states and the
+            # reference shows one of them. Compare against whichever of ours is
+            # nearest: identical if any is, otherwise the least different.
+            best = None
+            for obook in candidates:
+                n = [min(len(obook[i]), len(rbook[i])) for i in (0, 1)]
+                o = [top_n(obook, n[0])[0], top_n(obook, n[1])[1]]
+                r = [top_n(rbook, n[0])[0], top_n(rbook, n[1])[1]]
+                differing, ranks, om, rm = compare(o, r)
+                if best is None or differing < best[0]:
+                    best = (differing, ranks, om, rm, o, r, n)
+                if differing == 0:
+                    break
+            differing, ranks, om, rm, o, r, n = best
             total = n[0] + n[1]
             st["depth"] = max(st["depth"], total)
-
-            differing, ranks, om, rm = compare(o, r)
             st["matched"] += 1
             counts.append(differing)
             all_ranks.extend(ranks)
