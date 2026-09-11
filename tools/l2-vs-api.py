@@ -30,10 +30,16 @@ comes out "only in ours" and "only in ref" at once -- which is exactly what the
 first run against the public API produced. The raw strings are still shown,
 once, so a spelling difference is seen rather than silently absorbed.
 
+With -v every price the sides disagree on gets a line of its own under the
+frame's verdict -- the block time, the side, the price, and each source's
+sz/n there ("-" where that source has no such price) -- so a disagreement can
+be looked at rather than only counted.
+
 Standard library only.
 
   python3 l2-vs-api.py --coin BTC --seconds 120
   python3 l2-vs-api.py --ours ws://localhost:48001/ws ws://localhost:48002/ws --coin BTC --seconds 120
+  python3 l2-vs-api.py --ours ws://localhost:48001/ws ws://localhost:48002/ws -v     # and the levels themselves
   python3 l2-vs-api.py --ref ws://localhost:48000/ws --seconds 60   # control: must be 100% identical
 """
 
@@ -213,7 +219,8 @@ def nearest(cands_a, cands_b):
 
     Within one block a source passes through several states and another
     source, or the reference, shows one or more of them. Identical if any pair
-    is; otherwise the least different pair.
+    is; otherwise the least different pair. The untrimmed state picked on the
+    first side comes back last, for the level-by-level view.
     """
     best = None
     for a in cands_a:
@@ -221,10 +228,36 @@ def nearest(cands_a, cands_b):
             ta, tb, n = trimmed(a, b)
             differing, ranks, am, bm = compare(ta, tb)
             if best is None or differing < best[0]:
-                best = (differing, ranks, am, bm, ta, tb, n)
+                best = (differing, ranks, am, bm, ta, tb, n, a)
             if differing == 0:
                 return best
     return best
+
+
+def num(d):
+    """A Decimal as it reads, not as it was spelled: 78550.0 -> 78550, 0.50 -> 0.5."""
+    return format(d.normalize(), "f")
+
+
+def print_levels(t, books, order):
+    """One line per price the present sides disagree on: each side's sz/n."""
+    present = [lab for lab in order if lab in books]
+    for side, name in ((0, "bid"), (1, "ask")):
+        depth = min(len(books[lab][side]) for lab in present)
+        cut = {lab: top_n(books[lab], depth)[side] for lab in present}
+        for px in sorted(set().union(*cut.values()), key=float, reverse=(side == 0)):
+            vals = [cut[lab].get(px) for lab in present]
+            if all(v == vals[0] for v in vals):
+                continue
+            cells = []
+            for lab in order:
+                if lab not in books:
+                    cell = "(no frame)"
+                else:
+                    v = cut[lab].get(px)
+                    cell = "-" if v is None else "{}/{}".format(num(v[0]), v[1])
+                cells.append("{} {:<14}".format(lab, cell))
+            print("{}  {} {:>10}  {}".format(hhmmss(t), name, num(px), "  ".join(cells)))
 
 
 def quantile(values, q):
@@ -259,7 +292,7 @@ class Pair:
 
     def record(self, best):
         """Tally one match; returns its cell for the per-frame line."""
-        differing, ranks, am, bm, ta, tb, n = best
+        differing, ranks, am, bm, ta, tb, n, _ = best
         total = n[0] + n[1]
         self.depth = max(self.depth, total)
         self.matched += 1
@@ -347,6 +380,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=120.0)
     ap.add_argument("--wait", type=float, default=10.0,
                     help="how long a reference frame waits for ours at the same time")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="under each frame, one line per price the sides disagree on: each side's sz/n")
     args = ap.parse_args()
 
     sub = {"type": "l2Book", "coin": args.coin}
@@ -426,9 +461,12 @@ def main():
                 print("")
 
             cells = []
+            chosen = {"ref": rbook}    # the state of each source that stood nearest the reference
             for lab in labels:
                 if cands[lab]:
-                    cells.append(pairs[(lab, "ref")].record(nearest(cands[lab], [rbook])))
+                    best = nearest(cands[lab], [rbook])
+                    chosen[lab] = best[-1]
+                    cells.append(pairs[(lab, "ref")].record(best))
                 else:
                     unmatched[lab] += 1
                     cells.append("{}-ref  no frame at this time".format(lab))
@@ -437,6 +475,8 @@ def main():
                     if cands[a] and cands[b]:
                         cells.append(pairs[(a, b)].record(nearest(cands[a], cands[b])))
             print("{}  {}".format(hhmmss(t), " | ".join(cells)))
+            if args.verbose:
+                print_levels(t, chosen, labels + ["ref"])
 
     while _time.time() < deadline and (any(s.is_alive() for s in sources.values()) or ref.is_alive()):
         _time.sleep(0.5)
