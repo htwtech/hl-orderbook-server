@@ -29,7 +29,11 @@ pub(super) struct OrderBookState {
     // OrderStatuses. This is the other half of bidirectional caching - handles when Diff
     // arrives BEFORE Status. The anchor must survive the cache so a late-pairing priority
     // ALO order still splices into the right queue position.
-    pending_new_diffs: rustc_hash::FxHashMap<Oid, (crate::order_book::types::Sz, Option<Oid>, Instant)>,
+    // The owner rides along: when a New ages out without a status, whose it
+    // was decides whether that is a loss. The protocol address places spot
+    // orders the node never writes a status for.
+    pending_new_diffs:
+        rustc_hash::FxHashMap<Oid, (crate::order_book::types::Sz, Option<Oid>, Instant, alloy::primitives::Address)>,
     // insertBefore anchors that were missing from the book (add fell back to the back of
     // the level). Drained per batch by the listener, which converts a nonzero count into
     // a desync mark + Prometheus counter. Sticky across snapshot replay on purpose.
@@ -55,6 +59,14 @@ pub(super) struct OrderBookState {
     // lightweight memory envelope holds (the endpoint has no consumers in a
     // BBO-only deployment anyway).
     track_untriggered: bool,
+}
+
+/// The address the node uses for orders of its own -- spot liquidity it places
+/// itself. Their New diffs arrive like anyone else's; their statuses never do.
+/// Sixteen of sixteen New diffs aged out on a live server were its, on spot
+/// pairs, with no status line in the node's files at all.
+fn is_protocol_address(user: &alloy::primitives::Address) -> bool {
+    user.as_slice().iter().all(|&b| b == 0xff)
 }
 
 /// How many blocks a zeroing Update is remembered for, so the Remove the node
@@ -258,7 +270,8 @@ impl OrderBookState {
     ///   `is_inserted_into_book() == true` whose order never rested, so no New
     ///   diff ever comes) - evicted silently, NOT data loss.
     /// - An aged-out `pending_new_diffs` entry means a New diff never got its
-    ///   status: the book is missing that order, which IS data loss.
+    ///   status: the book is missing that order, which IS data loss -- unless
+    ///   the order is the protocol's own, for which no status is ever written.
     ///
     /// The size caps remain as a memory backstop. Overrunning one used to clear
     /// the whole map -- on mainnet that was ten thousand New diffs thrown away
@@ -312,21 +325,40 @@ impl OrderBookState {
             );
         }
 
-        let before = self.pending_new_diffs.len();
-        let mut sample = Vec::new();
-        self.pending_new_diffs.retain(|oid, (_, _, at)| {
+        let mut aged_other = 0usize;
+        let mut aged_protocol = 0usize;
+        let mut sample_other = Vec::new();
+        let mut sample_protocol = Vec::new();
+        self.pending_new_diffs.retain(|oid, (_, _, at, user)| {
             let keep = at.elapsed() < PENDING_MAX_AGE;
-            if !keep && sample.len() < SAMPLE {
-                sample.push(format!("oid={}", oid.value()));
+            if !keep {
+                let (count, sample) = if is_protocol_address(user) {
+                    (&mut aged_protocol, &mut sample_protocol)
+                } else {
+                    (&mut aged_other, &mut sample_other)
+                };
+                *count += 1;
+                if sample.len() < SAMPLE {
+                    sample.push(format!("oid={}", oid.value()));
+                }
             }
             keep
         });
-        let aged_diffs = before - self.pending_new_diffs.len();
-        if aged_diffs > 0 {
+        if aged_protocol > 0 {
+            // The protocol's own orders: a New with no status is how the node
+            // writes them. Not a loss the book could recover from by re-syncing.
+            crate::metrics::PENDING_NEW_EVICTED_TOTAL.with_label_values(&["protocol"]).inc_by(aged_protocol as u64);
+            log::info!(
+                "Evicted {aged_protocol} aged pending_new_diffs of the protocol address (no status is ever written for these); e.g. {}",
+                sample_protocol.join(", ")
+            );
+        }
+        if aged_other > 0 {
             // A New diff with no status in 60s: the order is missing from the book.
+            crate::metrics::PENDING_NEW_EVICTED_TOTAL.with_label_values(&["other"]).inc_by(aged_other as u64);
             log::warn!(
-                "Evicted {aged_diffs} aged pending_new_diffs entries (status never arrived - data loss); e.g. {}",
-                sample.join(", ")
+                "Evicted {aged_other} aged pending_new_diffs entries (status never arrived - data loss); e.g. {}",
+                sample_other.join(", ")
             );
             cleared = true;
         }
@@ -350,7 +382,7 @@ impl OrderBookState {
         if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
             let over = self.pending_new_diffs.len() - MAX_PENDING_DIFFS;
             let mut by_age: Vec<(Instant, Oid)> =
-                self.pending_new_diffs.iter().map(|(oid, (_, _, at))| (*at, oid.clone())).collect();
+                self.pending_new_diffs.iter().map(|(oid, (_, _, at, _))| (*at, oid.clone())).collect();
             by_age.sort_by_key(|(at, _)| *at);
             let sample: Vec<String> = by_age.iter().take(SAMPLE).map(|(_, oid)| format!("oid={}", oid.value())).collect();
             for (_, oid) in by_age.into_iter().take(over) {
@@ -448,7 +480,7 @@ impl OrderBookState {
             }
 
             // Check if there's a pending New diff for this order
-            if let Some((sz, insert_before, _)) = self.pending_new_diffs.remove(&oid) {
+            if let Some((sz, insert_before, _, _)) = self.pending_new_diffs.remove(&oid) {
                 // Both arrived - add order immediately!
                 let time = order_status.time.and_utc().timestamp_millis();
                 let order_coin = Coin::new(&order_status.order.coin);
@@ -485,7 +517,7 @@ impl OrderBookState {
         for (_, at) in self.pending_order_statuses.values_mut() {
             *at = backdated;
         }
-        for (_, _, at) in self.pending_new_diffs.values_mut() {
+        for (_, _, at, _) in self.pending_new_diffs.values_mut() {
             *at = backdated;
         }
     }
@@ -547,7 +579,7 @@ impl OrderBookState {
                         log::debug!("Order added (diff arrived after status): oid={:?} coin={:?}", oid, order_coin);
                     } else {
                         // Status hasn't arrived yet - cache the diff size + queue anchor
-                        self.pending_new_diffs.insert(oid.clone(), (sz, insert_before, Instant::now()));
+                        self.pending_new_diffs.insert(oid.clone(), (sz, insert_before, Instant::now(), diff.user()));
                     }
                 }
                 // An Update or Remove for an order that is not in the book is
@@ -683,8 +715,12 @@ mod tests {
     }
 
     fn make_order_diff(coin: &str, oid: u64, diff: OrderDiff) -> NodeDataOrderDiff {
+        make_order_diff_of("0x0000000000000000000000000000000000000000", coin, oid, diff)
+    }
+
+    fn make_order_diff_of(user: &str, coin: &str, oid: u64, diff: OrderDiff) -> NodeDataOrderDiff {
         serde_json::from_value(serde_json::json!({
-            "user": "0x0000000000000000000000000000000000000000",
+            "user": user,
             "oid": oid,
             "px": "100.0",
             "coin": coin,
@@ -1314,7 +1350,7 @@ mod tests {
         let now = Instant::now();
         for i in 0..=cap {
             state.pending_order_statuses.insert(Oid::new(i), (make_order_status("BTC", i, "open"), now));
-            state.pending_new_diffs.insert(Oid::new(i), (crate::order_book::Sz::new(1), None, now));
+            state.pending_new_diffs.insert(Oid::new(i), (crate::order_book::Sz::new(1), None, now, Address::new([0; 20])));
         }
         let older = now - Duration::from_secs(30);
         state.pending_order_statuses.get_mut(&Oid::new(7)).unwrap().1 = older;
@@ -1352,6 +1388,43 @@ mod tests {
         state.age_pending_entries(std::time::Duration::from_secs(61));
         // A New diff whose status never arrived means the book is missing an order.
         assert!(state.cleanup_stale_pending(), "aged diff eviction is data loss and must trigger a re-sync");
+        assert_eq!(state.pending_new_diffs_count(), 0);
+    }
+
+    #[test]
+    fn test_aged_new_from_the_protocol_address_is_not_data_loss() {
+        // The node writes the protocol's own spot orders into the book diffs
+        // and never into the statuses; waiting for one is not a loss, and
+        // re-syncing the whole book over it every six minutes was the last
+        // thing keeping the re-sync cycle alive.
+        let mut state = empty_state();
+        for i in 0..8u64 {
+            let diff = make_order_diff_of(
+                "0xffffffffffffffffffffffffffffffffffffffff",
+                "@32",
+                i,
+                OrderDiff::New { sz: "1.0".to_string(), insert_before: None },
+            );
+            state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+        }
+        state.age_pending_entries(std::time::Duration::from_secs(61));
+        assert!(!state.cleanup_stale_pending(), "the protocol's status-less orders must not force a re-sync");
+        assert_eq!(state.pending_new_diffs_count(), 0, "but they are still evicted");
+    }
+
+    #[test]
+    fn test_aged_new_of_the_protocol_address_does_not_hide_a_users() {
+        let mut state = empty_state();
+        let protocol = make_order_diff_of(
+            "0xffffffffffffffffffffffffffffffffffffffff",
+            "@32",
+            1,
+            OrderDiff::New { sz: "1.0".to_string(), insert_before: None },
+        );
+        let user = make_order_diff("BTC", 2, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![protocol, user])).unwrap();
+        state.age_pending_entries(std::time::Duration::from_secs(61));
+        assert!(state.cleanup_stale_pending(), "a user's New without a status is still a loss");
         assert_eq!(state.pending_new_diffs_count(), 0);
     }
 

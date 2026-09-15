@@ -398,6 +398,7 @@ The in-memory book is kept consistent with the node through three layers:
 6. **Rotation check** - after switching to a new hour file, the old one is checked once, 3 s later: if it grew past what was read from it, the node appended after the drain and those lines are gone. That is flagged as data loss and re-synced like any other, rather than carried silently.
 7. **Skew gate** - the status and diff streams are held within 32 blocks of each other. In steady state they are within a block or two and the gate never engages; after a stall (a snapshot install, a slow flush) both readers catch up in fixed-size chunks and one stream pulls thousands of blocks ahead, so every New in that stretch waits for a status still on disk. The pending caches overran their caps and were cleared whole -- ten thousand orders that would never rest, after every re-sync, which then seeded the next one. Held batches are released as the other stream catches up -- or, if that stream delivers nothing while this one delivers 10 000 batches, regardless: a stream that stops is the watchdog's case. Counted in `orderbook_skew_gate_held`. The caps themselves are now a memory backstop only (200 000 each): overrunning one evicts the oldest entries down to the cap, still counted as data loss.
 8. **Startup in step** - the initial snapshot is not installed until both book backfills have been delivered (installing takes the replay cache away, and backfill lines still in flight were being dropped: 62 457 on one start), and the two book readers begin live tracking together, the one that finished its backfill first waiting for the other, so the live streams do not start a whole backfill apart.
+9. **The protocol's own orders** - the node writes the spot orders of its own address (`0xff…ff`) into the book diffs but never into the order statuses, and a diff alone does not say which side the order is on, so these cannot rest in the book. They used to age out of the pending cache as "data loss" and re-sync the whole book every few minutes over orders it could never hold. They are now evicted quietly and counted in `orderbook_pending_new_evicted_total{owner="protocol"}`; a New from any other owner ageing out is still a loss and still re-syncs (`owner="other"`, expected to stay at zero). Consequence: on spot pairs the book can lack resting orders of `0xff…ff` that the public API shows. Perp books are not affected.
 
 ### Deduplication
 
@@ -452,6 +453,7 @@ curl http://localhost:9090/metrics
 | | `pending_orders_cache_size` | Pending order statuses in HFT cache |
 | | `pending_diffs_cache_size` | Pending book diffs in HFT cache |
 | | `orderbook_stream_skew_blocks` | Block height of the status stream minus the diff stream's (negative: diffs ahead) |
+| | `orderbook_pending_new_evicted_total{owner}` | New diffs aged out without a status: `protocol` (the node's own address, expected) or `other` (a loss; re-syncs) |
 | | `orderbook_skew_gate_held` | Book-stream batches held back so the two streams stay within 32 blocks of each other; zero in steady state |
 | | `uptime_seconds` | Server uptime in seconds |
 | | `server_start_time_seconds` | Server start timestamp (unix) |

@@ -220,6 +220,15 @@ lazy_static! {
         &["kind", "outcome"]
     ).expect("metric can be created");
 
+    /// New diffs that waited 60 s for a status that never came. `protocol` is
+    /// the address 0xff..ff, whose spot orders the node writes into the book
+    /// diffs but never into the order statuses -- expected, and not a loss the
+    /// book can do anything about. `other` is any other owner, and a loss.
+    pub static ref PENDING_NEW_EVICTED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("orderbook_pending_new_evicted_total", "New diffs aged out without a status, by owner class"),
+        &["owner"]
+    ).expect("metric can be created");
+
     /// Signed block skew between the two book streams: statuses height minus
     /// diffs height. Negative means the diffs run ahead, which is the direction
     /// that produces the `pending_*` outcomes above.
@@ -351,6 +360,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(ORDERBOOK_UNTRIGGERED_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(UNTRIGGERED_EVICTIONS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(DIFF_WITHOUT_ORDER_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(PENDING_NEW_EVICTED_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(STREAM_SKEW_BLOCKS.clone())).ok();
     REGISTRY.register(Box::new(SKEW_GATE_HELD.clone())).ok();
     REGISTRY.register(Box::new(BBO_CHANGES_TOTAL.clone())).ok();
