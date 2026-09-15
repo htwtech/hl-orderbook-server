@@ -228,6 +228,14 @@ lazy_static! {
         "Block height of the order-status stream minus that of the book-diff stream"
     ).expect("metric can be created");
 
+    /// Book batches held back by the skew gate so that neither stream runs
+    /// more than a few blocks ahead of the other. Zero in steady state; climbs
+    /// while the readers catch up after a stall, and falls back as they meet.
+    pub static ref SKEW_GATE_HELD: IntGauge = IntGauge::new(
+        "orderbook_skew_gate_held",
+        "Book-stream batches held back so the two streams stay within a few blocks of each other"
+    ).expect("metric can be created");
+
     /// BBO changes per coin (top 5 tracked individually)
     pub static ref BBO_CHANGES_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new("bbo_changes_total", "BBO changes by coin"),
@@ -344,6 +352,7 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(UNTRIGGERED_EVICTIONS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(DIFF_WITHOUT_ORDER_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(STREAM_SKEW_BLOCKS.clone())).ok();
+    REGISTRY.register(Box::new(SKEW_GATE_HELD.clone())).ok();
     REGISTRY.register(Box::new(BBO_CHANGES_TOTAL.clone())).ok();
 
     // Resync & lock metrics

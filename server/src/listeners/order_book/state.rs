@@ -260,9 +260,14 @@ impl OrderBookState {
     /// - An aged-out `pending_new_diffs` entry means a New diff never got its
     ///   status: the book is missing that order, which IS data loss.
     ///
-    /// The size caps remain as an OOM backstop; hitting one still force-clears
-    /// (fresh `HashMap::new()` so the high-water-mark bucket capacity is
-    /// actually released) and counts as data loss.
+    /// The size caps remain as a memory backstop. Overrunning one used to clear
+    /// the whole map -- on mainnet that was ten thousand New diffs thrown away
+    /// per second for several seconds after every snapshot install, each one an
+    /// order that would never rest, and the statuses of the next stretch with
+    /// them, which then seeded the next re-sync. Now only the oldest entries
+    /// go, down to the cap, and that still counts as data loss; with the skew
+    /// gate keeping the streams within blocks of each other the caps are not
+    /// expected to be reached at all.
     /// Also opportunistically compacts the orderbook slab allocators on the same
     /// cadence, since both are unbounded-growth vectors that the maintenance tick
     /// is responsible for bounding.
@@ -270,8 +275,8 @@ impl OrderBookState {
     /// Returns `true` when potentially-live data was evicted; the caller must
     /// treat this as data loss and mark the book for re-sync.
     pub(super) fn cleanup_stale_pending(&mut self) -> bool {
-        const MAX_PENDING_ORDERS: usize = 50_000;
-        const MAX_PENDING_DIFFS: usize = 10_000;
+        const MAX_PENDING_ORDERS: usize = 200_000;
+        const MAX_PENDING_DIFFS: usize = 200_000;
         const PENDING_MAX_AGE: Duration = Duration::from_secs(60);
 
         let mut cleared = false;
@@ -327,27 +332,34 @@ impl OrderBookState {
         }
 
         if self.pending_order_statuses.len() > MAX_PENDING_ORDERS {
-            let sample: Vec<String> = self.pending_order_statuses.iter().take(SAMPLE)
-                .map(|(oid, (st, _))| format!("oid={} {} {}", oid.value(), st.order.coin, st.status))
-                .collect();
+            let over = self.pending_order_statuses.len() - MAX_PENDING_ORDERS;
+            let mut by_age: Vec<(Instant, Oid)> =
+                self.pending_order_statuses.iter().map(|(oid, (_, at))| (*at, oid.clone())).collect();
+            by_age.sort_by_key(|(at, _)| *at);
+            let sample: Vec<String> = by_age.iter().take(SAMPLE).map(|(_, oid)| format!("oid={}", oid.value())).collect();
+            for (_, oid) in by_age.into_iter().take(over) {
+                self.pending_order_statuses.remove(&oid);
+            }
             log::warn!(
-                "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs); e.g. {}",
-                self.pending_order_statuses.len(),
+                "pending_order_statuses over its cap of {MAX_PENDING_ORDERS}: evicted the oldest {over} (data loss); e.g. {}",
                 sample.join(", ")
             );
-            self.pending_order_statuses = rustc_hash::FxHashMap::default();
             cleared = true;
         }
 
         if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
-            let sample: Vec<String> =
-                self.pending_new_diffs.keys().take(SAMPLE).map(|oid| format!("oid={}", oid.value())).collect();
+            let over = self.pending_new_diffs.len() - MAX_PENDING_DIFFS;
+            let mut by_age: Vec<(Instant, Oid)> =
+                self.pending_new_diffs.iter().map(|(oid, (_, _, at))| (*at, oid.clone())).collect();
+            by_age.sort_by_key(|(at, _)| *at);
+            let sample: Vec<String> = by_age.iter().take(SAMPLE).map(|(_, oid)| format!("oid={}", oid.value())).collect();
+            for (_, oid) in by_age.into_iter().take(over) {
+                self.pending_new_diffs.remove(&oid);
+            }
             log::warn!(
-                "Clearing stale pending_new_diffs cache: {} entries; e.g. {}",
-                self.pending_new_diffs.len(),
+                "pending_new_diffs over its cap of {MAX_PENDING_DIFFS}: evicted the oldest {over} (data loss); e.g. {}",
                 sample.join(", ")
             );
-            self.pending_new_diffs = rustc_hash::FxHashMap::default();
             cleared = true;
         }
 
@@ -1291,6 +1303,31 @@ mod tests {
     }
 
     // ==================== Cleanup Tests ====================
+
+    #[test]
+    fn test_over_cap_evicts_only_the_oldest_down_to_the_cap() {
+        // The caps used to clear the whole map. Fill past the cap, mark one
+        // entry as older than the rest, and only that one (plus none other)
+        // must go: exactly `over` entries, oldest first.
+        let mut state = empty_state();
+        let cap = 200_000u64;
+        let now = Instant::now();
+        for i in 0..=cap {
+            state.pending_order_statuses.insert(Oid::new(i), (make_order_status("BTC", i, "open"), now));
+            state.pending_new_diffs.insert(Oid::new(i), (crate::order_book::Sz::new(1), None, now));
+        }
+        let older = now - Duration::from_secs(30);
+        state.pending_order_statuses.get_mut(&Oid::new(7)).unwrap().1 = older;
+        state.pending_new_diffs.get_mut(&Oid::new(9)).unwrap().2 = older;
+
+        assert!(state.cleanup_stale_pending(), "an over-cap eviction is still data loss");
+        assert_eq!(state.pending_order_statuses_count() as u64, cap);
+        assert_eq!(state.pending_new_diffs_count() as u64, cap);
+        assert!(!state.pending_order_statuses_has(&Oid::new(7)), "the oldest status went");
+        assert!(!state.pending_new_diffs_has(&Oid::new(9)), "the oldest diff went");
+        assert!(state.pending_order_statuses_has(&Oid::new(cap)), "the newest stayed");
+        assert!(state.pending_new_diffs_has(&Oid::new(cap)));
+    }
 
     #[test]
     fn test_cleanup_evicts_aged_statuses_silently() {
