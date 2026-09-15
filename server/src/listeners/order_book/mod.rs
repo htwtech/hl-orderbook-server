@@ -1656,12 +1656,12 @@ impl Drop for ActiveSubGuard {
 /// batches are held back. Zero to two in steady state (see
 /// `orderbook_stream_skew_blocks`), so this never engages there.
 const SKEW_GATE_BLOCKS: u64 = 32;
-/// Held batches are released once the other stream has not advanced for this
-/// long: a stream that stops is a dead stream, the watchdog's case, and the
-/// book must not freeze behind it. A stream that is merely slow -- catching up
-/// after a start or an install -- keeps advancing, and the held side keeps
-/// waiting; releasing on the wait alone let the skew rebuild every two seconds.
-const SKEW_GATE_TIMEOUT: Duration = Duration::from_secs(2);
+/// A held stream is let through once this many of its batches have arrived
+/// while the other stream delivered none at all: the other stream is dead,
+/// the watchdog's case, and the book must not freeze behind it. Counted in
+/// batches rather than seconds on purpose -- the listener itself pauses for
+/// seconds under load, and a clock would call every such pause a death.
+const SKEW_GATE_STALL_BATCHES: u64 = 10_000;
 /// Held batches are small (a line is one or two events) but the backlog after
 /// a long stall is not; past this many, release regardless.
 const SKEW_GATE_MAX_HELD: usize = 200_000;
@@ -1678,25 +1678,26 @@ const SKEW_GATE_MAX_HELD: usize = 200_000;
 /// on mainnet: ten thousand New diffs thrown away per second, every second, for
 /// several seconds after each install -- and every one of them a hole in the
 /// book. Holding the stream that is ahead bounds the wait to a few blocks.
+///
+/// A held stream is not a stopped one. The first version released held
+/// batches after two seconds of the *other* stream not advancing -- but a
+/// held stream does not advance either, and while the listener applied one
+/// mass release the other side looked stopped in turn: a two-second seesaw
+/// that ran the skew to 1 500 blocks and the pending caches past their caps.
+/// Now only delivery counts: a stream is stopped when the other has delivered
+/// SKEW_GATE_STALL_BATCHES batches and it has delivered none.
 struct SkewGate {
     /// Highest height applied from [statuses, diffs].
     frontier: [u64; 2],
-    /// When each frontier last moved.
-    advanced_at: [Instant; 2],
+    /// Batches delivered by each stream since the other last delivered one.
+    since_other: [u64; 2],
     /// Batches held back, per stream, in arrival order.
     held: [VecDeque<(u64, EventBatch)>; 2],
 }
 
 impl SkewGate {
-    fn new(now: Instant) -> Self {
-        Self { frontier: [0, 0], advanced_at: [now, now], held: [VecDeque::new(), VecDeque::new()] }
-    }
-
-    fn advance(&mut self, me: usize, height: u64, now: Instant) {
-        if height > self.frontier[me] {
-            self.frontier[me] = height;
-            self.advanced_at[me] = now;
-        }
+    fn new() -> Self {
+        Self { frontier: [0, 0], since_other: [0, 0], held: [VecDeque::new(), VecDeque::new()] }
     }
 
     const fn slot(source: EventSource) -> Option<usize> {
@@ -1708,9 +1709,11 @@ impl SkewGate {
     }
 
     /// Offer a live batch; returns everything that may be applied now, in order.
-    fn offer(&mut self, height: u64, batch: EventBatch, source: EventSource, now: Instant) -> Vec<(u64, EventBatch, EventSource)> {
+    fn offer(&mut self, height: u64, batch: EventBatch, source: EventSource) -> Vec<(u64, EventBatch, EventSource)> {
         let Some(me) = Self::slot(source) else { return vec![(height, batch, source)] };
         let other = 1 - me;
+        self.since_other[me] += 1;
+        self.since_other[other] = 0;
         // Until both streams have spoken there is nothing to be ahead of.
         let ahead = self.frontier[other] > 0 && height > self.frontier[other] + SKEW_GATE_BLOCKS;
         let mut out = Vec::new();
@@ -1718,33 +1721,33 @@ impl SkewGate {
             // Behind anything already held from this stream: order must hold.
             self.held[me].push_back((height, batch));
         } else {
-            self.advance(me, height, now);
+            self.frontier[me] = self.frontier[me].max(height);
             out.push((height, batch, source));
         }
-        self.release(now, &mut out);
+        self.release(&mut out);
         out
     }
 
     /// Release held batches that are now within reach of the other stream, or
-    /// whose other stream has stopped advancing, or that are simply too many.
+    /// whose other stream has stopped delivering, or that are simply too many.
     /// Each release may advance a frontier and free the other side in turn, so
     /// loop to a fixpoint.
-    fn release(&mut self, now: Instant, out: &mut Vec<(u64, EventBatch, EventSource)>) {
+    fn release(&mut self, out: &mut Vec<(u64, EventBatch, EventSource)>) {
         loop {
             let mut moved = false;
             for me in 0..2 {
                 let other = 1 - me;
                 let source = if me == 0 { EventSource::OrderStatuses } else { EventSource::OrderDiffs };
-                let other_stalled = now.duration_since(self.advanced_at[other]) >= SKEW_GATE_TIMEOUT;
+                let other_stopped = self.since_other[me] >= SKEW_GATE_STALL_BATCHES;
                 while let Some((h, _)) = self.held[me].front() {
                     let due = *h <= self.frontier[other] + SKEW_GATE_BLOCKS
-                        || other_stalled
+                        || other_stopped
                         || self.held[me].len() > SKEW_GATE_MAX_HELD;
                     if !due {
                         break;
                     }
                     let Some((h, b)) = self.held[me].pop_front() else { break };
-                    self.advance(me, h, now);
+                    self.frontier[me] = self.frontier[me].max(h);
                     out.push((h, b, source));
                     moved = true;
                 }
@@ -1753,14 +1756,6 @@ impl SkewGate {
                 break;
             }
         }
-    }
-
-    /// On a tick: batches held behind a stream that has stopped, so a dead
-    /// stream cannot keep the other one held until an event happens to arrive.
-    fn expire(&mut self, now: Instant) -> Vec<(u64, EventBatch, EventSource)> {
-        let mut out = Vec::new();
-        self.release(now, &mut out);
-        out
     }
 
     fn held_count(&self) -> usize {
@@ -1848,7 +1843,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         Desync,
     }
 
-    let mut gate = SkewGate::new(Instant::now());
+    let mut gate = SkewGate::new();
 
     info!("Main event loop starting");
 
@@ -1863,13 +1858,9 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
             // and the tick is only Ready every L2_FLUSH_TICK_MS, so it cannot starve
             // the event arm in return.
             _ = l2_flush_ticker.tick() => {
-                let expired = gate.expire(Instant::now());
                 let lock_start = Instant::now();
                 let mut guard = listener.lock().await;
                 LISTENER_LOCK_WAIT.observe(lock_start.elapsed().as_secs_f64());
-                for (height, batch, source) in expired {
-                    guard.apply_event_batch(height, batch, source);
-                }
                 guard.flush_l2_if_due();
             }
 
@@ -1911,7 +1902,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         } else {
                             // Live batches pass through the skew gate, which
                             // may hold this one or release earlier ones.
-                            for (h, b, s) in gate.offer(height, batch, source, Instant::now()) {
+                            for (h, b, s) in gate.offer(height, batch, source) {
                                 actions.push(Action::Apply(h, b, s));
                             }
                         }
@@ -3056,91 +3047,95 @@ mod tests {
 
     #[test]
     fn skew_gate_passes_streams_that_stay_in_step() {
-        let mut gate = SkewGate::new(Instant::now());
-        let now = Instant::now();
+        let mut gate = SkewGate::new();
         for h in 100..110 {
-            assert_eq!(passed(&gate.offer(h, statuses_at(h), EventSource::OrderStatuses, now)), vec![(h, "orders")]);
-            assert_eq!(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs, now)), vec![(h, "diffs")]);
+            assert_eq!(passed(&gate.offer(h, statuses_at(h), EventSource::OrderStatuses)), vec![(h, "orders")]);
+            assert_eq!(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)), vec![(h, "diffs")]);
         }
         assert_eq!(gate.held_count(), 0);
     }
 
     #[test]
     fn skew_gate_holds_the_stream_that_runs_ahead_and_releases_it_in_order() {
-        let mut gate = SkewGate::new(Instant::now());
-        let now = Instant::now();
-        gate.offer(100, statuses_at(100), EventSource::OrderStatuses, now);
+        let mut gate = SkewGate::new();
+        gate.offer(100, statuses_at(100), EventSource::OrderStatuses);
         // Diffs race ahead: up to 100 + 32 pass, the rest wait.
         let mut through = Vec::new();
         for h in 100..=150 {
-            through.extend(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs, now)));
+            through.extend(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)));
         }
         assert_eq!(through.last(), Some(&(132, "diffs")));
         assert_eq!(gate.held_count(), 18, "133..=150 held");
 
         // Statuses catch up block by block; each one frees the diffs it brings within reach.
-        let out = gate.offer(101, statuses_at(101), EventSource::OrderStatuses, now);
+        let out = gate.offer(101, statuses_at(101), EventSource::OrderStatuses);
         assert_eq!(passed(&out), vec![(101, "orders"), (133, "diffs")]);
-        let out = gate.offer(110, statuses_at(110), EventSource::OrderStatuses, now);
+        let out = gate.offer(110, statuses_at(110), EventSource::OrderStatuses);
         assert_eq!(passed(&out), vec![(110, "orders")].into_iter().chain((134..=142).map(|h| (h, "diffs"))).collect::<Vec<_>>());
-        let out = gate.offer(130, statuses_at(130), EventSource::OrderStatuses, now);
+        let out = gate.offer(130, statuses_at(130), EventSource::OrderStatuses);
         assert_eq!(passed(&out), vec![(130, "orders")].into_iter().chain((143..=150).map(|h| (h, "diffs"))).collect::<Vec<_>>());
         assert_eq!(gate.held_count(), 0);
 
         // A block has many lines. A second batch at 163 arriving while the first
         // is held must queue behind everything held, not jump the line.
         for h in 151..=170 {
-            gate.offer(h, diffs_at(h), EventSource::OrderDiffs, now);
+            gate.offer(h, diffs_at(h), EventSource::OrderDiffs);
         }
         assert_eq!(gate.held_count(), 8, "163..=170 held behind statuses at 130");
-        assert!(passed(&gate.offer(163, diffs_at(163), EventSource::OrderDiffs, now)).is_empty());
-        let out = gate.offer(131, statuses_at(131), EventSource::OrderStatuses, now);
+        assert!(passed(&gate.offer(163, diffs_at(163), EventSource::OrderDiffs)).is_empty());
+        let out = gate.offer(131, statuses_at(131), EventSource::OrderStatuses);
         assert_eq!(passed(&out), vec![(131, "orders"), (163, "diffs")], "only the first 163 is within reach");
         assert_eq!(gate.held_count(), 8, "the second 163 waits its turn behind 170");
     }
 
     #[test]
     fn skew_gate_is_symmetric() {
-        let mut gate = SkewGate::new(Instant::now());
-        let now = Instant::now();
-        gate.offer(100, diffs_at(100), EventSource::OrderDiffs, now);
+        let mut gate = SkewGate::new();
+        gate.offer(100, diffs_at(100), EventSource::OrderDiffs);
         for h in 100..=140 {
-            gate.offer(h, statuses_at(h), EventSource::OrderStatuses, now);
+            gate.offer(h, statuses_at(h), EventSource::OrderStatuses);
         }
         assert_eq!(gate.held_count(), 8, "statuses 133..=140 held behind the diffs");
-        let out = gate.offer(110, diffs_at(110), EventSource::OrderDiffs, now);
+        let out = gate.offer(110, diffs_at(110), EventSource::OrderDiffs);
         assert_eq!(passed(&out), vec![(110, "diffs")].into_iter().chain((133..=140).map(|h| (h, "orders"))).collect::<Vec<_>>());
     }
 
     #[test]
-    fn skew_gate_releases_only_behind_a_stream_that_has_stopped() {
-        let mut gate = SkewGate::new(Instant::now());
-        let t0 = Instant::now();
-        gate.offer(100, statuses_at(100), EventSource::OrderStatuses, t0);
-        assert!(passed(&gate.offer(200, diffs_at(200), EventSource::OrderDiffs, t0)).is_empty());
-        assert!(gate.expire(t0 + SKEW_GATE_TIMEOUT / 2).is_empty(), "not yet");
+    fn skew_gate_releases_only_behind_a_stream_that_stopped_delivering() {
+        let mut gate = SkewGate::new();
+        gate.offer(100, statuses_at(100), EventSource::OrderStatuses);
+        assert!(passed(&gate.offer(200, diffs_at(200), EventSource::OrderDiffs)).is_empty());
 
-        // Statuses keep coming, slowly: the held diff keeps waiting however long
-        // it has waited -- a slow stream is not a dead one.
-        let t1 = t0 + SKEW_GATE_TIMEOUT * 3 / 4;
-        assert_eq!(passed(&gate.offer(101, statuses_at(101), EventSource::OrderStatuses, t1)), vec![(101, "orders")]);
-        assert!(gate.expire(t0 + SKEW_GATE_TIMEOUT).is_empty(), "statuses advanced a moment ago");
-        assert!(gate.expire(t1 + SKEW_GATE_TIMEOUT / 2).is_empty());
+        // Statuses keep coming, however slowly and however far behind: the held
+        // diff keeps waiting. Being held is not being stopped.
+        for _ in 0..3 {
+            for h in 201..(201 + SKEW_GATE_STALL_BATCHES / 2) {
+                assert!(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)).is_empty());
+            }
+            assert_eq!(passed(&gate.offer(101, statuses_at(101), EventSource::OrderStatuses)), vec![(101, "orders")]);
+        }
+        assert!(gate.held_count() > 0);
 
-        // Then they stop: two seconds after their last step, the diff goes through.
-        assert_eq!(passed(&gate.expire(t1 + SKEW_GATE_TIMEOUT)), vec![(200, "diffs")]);
-        assert_eq!(gate.held_count(), 0);
+        // Then the statuses stop for good: after STALL_BATCHES diffs with no
+        // status among them, the diffs go through, in order.
+        let mut released = Vec::new();
+        for h in 1000..(1000 + SKEW_GATE_STALL_BATCHES) {
+            released.extend(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)));
+        }
+        assert_eq!(released.first(), Some(&(200, "diffs")), "the first held goes first");
+        assert_eq!(gate.held_count(), 0, "everything held went through");
+        // ...and stays open while the statuses stay silent.
+        assert_eq!(passed(&gate.offer(5000, diffs_at(5000), EventSource::OrderDiffs)), vec![(5000, "diffs")]);
     }
 
     #[test]
     fn skew_gate_does_not_engage_until_both_streams_have_spoken() {
-        let mut gate = SkewGate::new(Instant::now());
-        let now = Instant::now();
+        let mut gate = SkewGate::new();
         for h in 1..=100 {
-            assert_eq!(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs, now)), vec![(h, "diffs")]);
+            assert_eq!(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)), vec![(h, "diffs")]);
         }
         // Fills are never held.
         let fills = EventBatch::Fills(make_fills_batch(&["BTC"], 500));
-        assert_eq!(passed(&gate.offer(500, fills, EventSource::Fills, now)), vec![(500, "fills")]);
+        assert_eq!(passed(&gate.offer(500, fills, EventSource::Fills)), vec![(500, "fills")]);
     }
 }
