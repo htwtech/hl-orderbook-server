@@ -34,12 +34,13 @@ pub(super) struct OrderBookState {
     // the level). Drained per batch by the listener, which converts a nonzero count into
     // a desync mark + Prometheus counter. Sticky across snapshot replay on purpose.
     insert_before_fallbacks: u64,
-    // Orders emptied by an Update to zero, by block. On a full fill the node
-    // writes that update and then a Remove for the same oid in the same block;
-    // the Remove finds nothing, and that is expected -- kept apart from a
-    // Remove that is unknown for real. Cleared as the diff stream moves on to
-    // the next block.
-    zeroed_in_block: (u64, rustc_hash::FxHashSet<Oid>),
+    // Orders emptied by an Update to zero, with the block it happened in. On a
+    // full fill the node writes that update and, some blocks later, a Remove
+    // for the same oid; the Remove finds nothing, and that is expected --
+    // kept apart from a Remove that is unknown for real. Entries older than
+    // ZEROED_WINDOW_BLOCKS are dropped as the diff stream moves on.
+    zeroed_recently: std::collections::VecDeque<(u64, Oid)>,
+    zeroed_set: rustc_hash::FxHashSet<Oid>,
     // Untriggered trigger orders (stop / TP-SL waiting for triggerPx to be crossed),
     // keyed per coin so single-coin queries and bogus-coin probes never scan the
     // whole set. These never rest on the book: the hl-node snapshot appends them to
@@ -55,6 +56,12 @@ pub(super) struct OrderBookState {
     // BBO-only deployment anyway).
     track_untriggered: bool,
 }
+
+/// How many blocks a zeroing Update is remembered for, so the Remove the node
+/// writes for the same order later is recognised as its follow-up. A window
+/// of one block caught roughly one such Remove in ten on mainnet; the rest
+/// land in later blocks.
+const ZEROED_WINDOW_BLOCKS: u64 = 64;
 
 impl OrderBookState {
     pub(super) fn from_snapshot(
@@ -109,7 +116,8 @@ impl OrderBookState {
             pending_order_statuses: rustc_hash::FxHashMap::default(),
             pending_new_diffs: rustc_hash::FxHashMap::default(),
             insert_before_fallbacks: 0,
-            zeroed_in_block: (0, rustc_hash::FxHashSet::default()),
+            zeroed_recently: std::collections::VecDeque::new(),
+            zeroed_set: rustc_hash::FxHashSet::default(),
             untriggered_orders,
             track_untriggered,
         }
@@ -439,8 +447,14 @@ impl OrderBookState {
         let height = batch.block_number();
         let time = batch.block_time();
         let mut changed_coins = HashSet::new();
-        if self.zeroed_in_block.0 != height {
-            self.zeroed_in_block = (height, rustc_hash::FxHashSet::default());
+        // Forget zeroings that are too old to have their Remove still coming.
+        while let Some(&(at, _)) = self.zeroed_recently.front() {
+            if at.saturating_add(ZEROED_WINDOW_BLOCKS) >= height {
+                break;
+            }
+            if let Some((_, oid)) = self.zeroed_recently.pop_front() {
+                self.zeroed_set.remove(&oid);
+            }
         }
 
         // Update height/time to track progress (>= ensures time updates even at same height)
@@ -489,20 +503,21 @@ impl OrderBookState {
                 // since nothing marked it as a loss.
                 InnerOrderDiff::Update { new_sz, .. } => {
                     if self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
-                        if new_sz.value() == 0 {
-                            self.zeroed_in_block.1.insert(oid.clone());
+                        if new_sz.value() == 0 && self.zeroed_set.insert(oid.clone()) {
+                            self.zeroed_recently.push_back((height, oid.clone()));
                         }
                     } else {
-                        self.apply_diff_to_pending_new(&oid, "update", Some(new_sz));
+                        self.apply_diff_to_pending_new(&oid, "update", Some(new_sz), &coin, height);
                     }
                     changed_coins.insert(coin);
                 }
                 InnerOrderDiff::Remove => {
                     if !self.order_book.cancel_order(oid.clone(), coin.clone()) {
-                        if self.zeroed_in_block.1.remove(&oid) {
+                        if self.zeroed_set.remove(&oid) {
+                            // The deque entry expires on its own; the set is what is looked up.
                             crate::metrics::DIFF_WITHOUT_ORDER_TOTAL.with_label_values(&["remove", "after_zero"]).inc();
                         } else {
-                            self.apply_diff_to_pending_new(&oid, "remove", None);
+                            self.apply_diff_to_pending_new(&oid, "remove", None, &coin, height);
                         }
                     }
                     changed_coins.insert(coin);
@@ -517,7 +532,14 @@ impl OrderBookState {
     /// the order rests with the right size -- or not at all. The waiting entry
     /// keeps its original timestamp: the age is measured from the New, and a
     /// status that never comes must still be noticed by the eviction.
-    fn apply_diff_to_pending_new(&mut self, oid: &Oid, kind: &'static str, new_sz: Option<crate::order_book::Sz>) {
+    fn apply_diff_to_pending_new(
+        &mut self,
+        oid: &Oid,
+        kind: &'static str,
+        new_sz: Option<crate::order_book::Sz>,
+        coin: &Coin,
+        height: u64,
+    ) {
         let outcome = match new_sz {
             _ if !self.pending_new_diffs.contains_key(oid) => "unknown",
             // A size update: the order will rest with this size, not the New's.
@@ -536,7 +558,18 @@ impl OrderBookState {
         };
         crate::metrics::DIFF_WITHOUT_ORDER_TOTAL.with_label_values(&[kind, outcome]).inc();
         if outcome == "unknown" {
-            log::debug!("{kind} diff for oid={oid:?} that is neither resting nor pending");
+            // A counter says how many; it takes an oid to find out what they
+            // are (tools/diff-orphans.py --oids). One in a thousand, at info,
+            // is enough to sample from and cannot flood the log.
+            static UNKNOWN_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = UNKNOWN_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 1000 == 0 {
+                log::info!(
+                    "diff without order (sample 1/1000): {kind} oid={} coin={} height={height}",
+                    oid.value(),
+                    coin.value()
+                );
+            }
         }
     }
 }
@@ -608,10 +641,14 @@ mod tests {
     }
 
     fn make_diff_batch(diffs: Vec<NodeDataOrderDiff>) -> Batch<NodeDataOrderDiff> {
+        make_diff_batch_at(100, diffs)
+    }
+
+    fn make_diff_batch_at(block: u64, diffs: Vec<NodeDataOrderDiff>) -> Batch<NodeDataOrderDiff> {
         serde_json::from_value(serde_json::json!({
             "local_time": "2024-01-15T10:30:00.000000000",
             "block_time": "2024-01-15T10:30:00.000000000",
-            "block_number": 100,
+            "block_number": block,
             "events": diffs
         })).unwrap()
     }
@@ -1076,17 +1113,34 @@ mod tests {
         state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
         assert_eq!(state.order_count(), 1);
 
-        // A full fill: the node empties the order, then removes it, same block
-        // (every test batch is block 100).
+        // A full fill: the node empties the order, and removes it some blocks later.
         let zero = make_order_diff("BTC", 11, OrderDiff::Update { orig_sz: "1.0".to_string(), new_sz: "0".to_string() });
-        state.apply_order_diffs_hft(make_diff_batch(vec![zero])).unwrap();
+        state.apply_order_diffs_hft(make_diff_batch_at(100, vec![zero])).unwrap();
         assert_eq!(state.order_count(), 0);
-        assert!(state.zeroed_in_block.1.contains(&Oid::new(11)), "the zeroing is remembered for the block");
+        assert!(state.zeroed_set.contains(&Oid::new(11)), "the zeroing is remembered");
 
         let remove = make_order_diff("BTC", 11, OrderDiff::Remove);
-        state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
-        assert!(!state.zeroed_in_block.1.contains(&Oid::new(11)), "the Remove was recognised as the follow-up, not unknown");
+        state.apply_order_diffs_hft(make_diff_batch_at(100 + ZEROED_WINDOW_BLOCKS, vec![remove])).unwrap();
+        assert!(!state.zeroed_set.contains(&Oid::new(11)), "the Remove was recognised as the follow-up, not unknown");
         assert_eq!(state.pending_new_diffs_count(), 0);
+    }
+
+    #[test]
+    fn test_a_zeroing_is_forgotten_past_the_window() {
+        let mut state = empty_state();
+        let status = make_order_status("BTC", 12, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let new = make_order_diff("BTC", 12, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        let zero = make_order_diff("BTC", 12, OrderDiff::Update { orig_sz: "1.0".to_string(), new_sz: "0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch_at(100, vec![zero])).unwrap();
+        assert!(state.zeroed_set.contains(&Oid::new(12)));
+
+        // Any diff batch past the window expires it, before its own events apply.
+        let other = make_order_diff("BTC", 13, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch_at(100 + ZEROED_WINDOW_BLOCKS + 1, vec![other])).unwrap();
+        assert!(!state.zeroed_set.contains(&Oid::new(12)), "expired");
+        assert!(state.zeroed_recently.is_empty());
     }
 
     #[test]

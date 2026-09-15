@@ -54,6 +54,11 @@ impl Oid {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    /// The bare number, for log lines that must be greppable in the node's files.
+    pub(crate) const fn value(&self) -> u64 {
+        self.0
+    }
 }
 
 pub(crate) trait InnerOrder: Clone {
