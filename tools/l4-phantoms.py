@@ -13,7 +13,9 @@ in the form diff-orphans.py --oids reads, so the node's own files can then tell
 what really happened to each order.
 
 The band is re-centred on A's mid every poll; the first poll is unbanded to
-find it, and is slow on a deep book.
+find it, and is slow on a deep book. An order that leaves the band because the
+band moved is not "gone", and one that comes back is not news: each oid is
+announced once.
 
   python3 l4-phantoms.py --a http://localhost:48001 --b http://localhost:48002 --coin BTC --seconds 600
   python3 diff-orphans.py --data-dir /home/hyperliquid/hl-data/data --oids phantoms.txt --hours 1
@@ -59,13 +61,18 @@ def fetch(base, coin, lo, hi, timeout):
 
 
 def band_around(orders, frac):
+    """(lo, hi) as Decimals, or (None, None) with an empty side."""
     bids = [px for side, px, _, _ in orders.values() if side == 0]
     asks = [px for side, px, _, _ in orders.values() if side == 1]
     if not bids or not asks:
         return None, None
     mid = (max(bids) + min(asks)) / 2
     q = Decimal("1e-8")
-    return "{:f}".format((mid * (1 - frac)).quantize(q)), "{:f}".format((mid * (1 + frac)).quantize(q))
+    return (mid * (1 - frac)).quantize(q), (mid * (1 + frac)).quantize(q)
+
+
+def fmt(px):
+    return None if px is None else "{:f}".format(px)
 
 
 def short(user):
@@ -84,9 +91,10 @@ def clock():
 
 
 class Candidate:
-    def __init__(self, kind, oid, height, detail):
+    def __init__(self, kind, oid, height, detail, px):
         self.kind = kind
         self.oid = oid
+        self.px = px
         self.first_wall = time.time()
         self.first_height = height
         self.detail = detail
@@ -113,6 +121,7 @@ def main():
 
     cands = {}  # (kind, oid) -> Candidate
     reported = []  # Candidates in the order reported
+    announced = set()  # (kind, oid) already printed: back in the band is not news
     out = open(args.out, "a", encoding="utf-8")
     lo = hi = None
     polls = failed = 0
@@ -124,8 +133,8 @@ def main():
         while time.time() < deadline:
             started = time.time()
             timeout = 60.0 if lo is None else 10.0
-            fa = pool.submit(fetch, args.a, args.coin, lo, hi, timeout)
-            fb = pool.submit(fetch, args.b, args.coin, lo, hi, timeout)
+            fa = pool.submit(fetch, args.a, args.coin, fmt(lo), fmt(hi), timeout)
+            fb = pool.submit(fetch, args.b, args.coin, fmt(lo), fmt(hi), timeout)
             try:
                 ta, ha, A = fa.result()
                 tb, hb, B = fb.result()
@@ -135,21 +144,22 @@ def main():
                 time.sleep(args.every)
                 continue
             polls += 1
+            asked_lo, asked_hi = lo, hi  # the band these snapshots were taken with
             lo, hi = band_around(A, Decimal(str(args.band)))
             max_height_gap = max(max_height_gap, abs(ha - hb))
 
             seen = set()
             for oid in A.keys() - B.keys():
                 seen.add(("A only", oid))
-                cands.setdefault(("A only", oid), Candidate("A only", oid, ha, describe(A[oid])))
+                cands.setdefault(("A only", oid), Candidate("A only", oid, ha, describe(A[oid]), A[oid][1]))
             for oid in B.keys() - A.keys():
                 seen.add(("B only", oid))
-                cands.setdefault(("B only", oid), Candidate("B only", oid, hb, describe(B[oid])))
+                cands.setdefault(("B only", oid), Candidate("B only", oid, hb, describe(B[oid]), B[oid][1]))
             for oid in A.keys() & B.keys():
                 if A[oid][:3] != B[oid][:3]:
                     seen.add(("differs", oid))
                     cands.setdefault(("differs", oid), Candidate(
-                        "differs", oid, ha, "A: {} | B: {}".format(describe(A[oid]), describe(B[oid]))))
+                        "differs", oid, ha, "A: {} | B: {}".format(describe(A[oid]), describe(B[oid])), A[oid][1]))
 
             for key in list(cands):
                 c = cands[key]
@@ -157,18 +167,22 @@ def main():
                     c.polls += 1
                     if c.polls == args.hold:
                         c.reported = True
-                        reported.append(c)
-                        heights = "" if abs(ha - hb) <= 2 else "  (heights A {} B {})".format(ha, hb)
-                        print("{}  {:7}  oid={} {}  since h {}{}".format(
-                            clock(), c.kind, c.oid, c.detail, c.first_height, heights))
-                        out.write("{}\n".format(c.oid))
-                        out.flush()
-                elif c.reported:
+                        if key not in announced:
+                            announced.add(key)
+                            reported.append(c)
+                            heights = "" if abs(ha - hb) <= 2 else "  (heights A {} B {})".format(ha, hb)
+                            print("{}  {:7}  oid={} {}  since h {}{}".format(
+                                clock(), c.kind, c.oid, c.detail, c.first_height, heights))
+                            out.write("{}\n".format(c.oid))
+                            out.flush()
+                    continue
+                # Not in this poll's difference set. Gone from the book -- or
+                # only from the band, which moved with the price.
+                in_band = asked_lo is None or asked_lo <= c.px <= asked_hi
+                if c.reported and in_band:
                     print("{}  {:7}  oid={} gone after {:.0f} s  (h {} .. {})".format(
                         clock(), c.kind, c.oid, time.time() - c.first_wall, c.first_height, max(ha, hb)))
-                    del cands[key]
-                else:
-                    del cands[key]
+                del cands[key]
 
             if time.time() - last_progress >= args.progress:
                 last_progress = time.time()
