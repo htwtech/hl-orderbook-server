@@ -211,6 +211,12 @@ def verdict(diffs, statuses):
     names = [s for _, s, _ in statuses]
     if not diffs and not statuses:
         return "nothing in the window: older than that"
+    # A New after a Remove for the same oid: the node re-placed the order under
+    # the oid it already had. A server that dropped the first New on the Remove
+    # and then paired the status with nothing has lost a live order.
+    if "remove" in kinds and "new" in kinds[kinds.index("remove"):]:
+        return "re-placed under the same oid after a Remove ({} News, {} Removes): a pending New dropped on that Remove would be a live order lost".format(
+            kinds.count("new"), kinds.count("remove"))
     if "new" in kinds:
         if "open" in names or "triggered" in names:
             return "New and open both in the window: the server should have held this order -- lost inside the server"
@@ -247,7 +253,7 @@ def trace_oids(args, diffs_files, statuses_files):
         d = sorted(all_diffs.get(oid, []))
         st = sorted(all_statuses.get(oid, []), key=lambda x: x[0])
         v = verdict(d, st)
-        key = re.sub(r" ?@\d+| ?\(\d+ blocks apart\)| ?\(statuses: [^)]*\)", "", v)
+        key = re.sub(r" ?@\d+| ?\(\d+ blocks apart\)| ?\(statuses: [^)]*\)| ?\(\d+ News, \d+ Removes\)", "", v)
         verdicts[re.sub(r"\s+", " ", key).replace(" :", ":").strip()] += 1
         order = st[0][2] if st else {}
         print("\noid {}  coin {} {} px {} tif {} trigger {}".format(

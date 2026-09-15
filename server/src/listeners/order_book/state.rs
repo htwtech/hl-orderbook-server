@@ -557,19 +557,25 @@ impl OrderBookState {
             }
         };
         crate::metrics::DIFF_WITHOUT_ORDER_TOTAL.with_label_values(&[kind, outcome]).inc();
-        if outcome == "unknown" {
-            // A counter says how many; it takes an oid to find out what they
-            // are (tools/diff-orphans.py --oids). One in a thousand, at info,
-            // is enough to sample from and cannot flood the log.
-            static UNKNOWN_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = UNKNOWN_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n % 1000 == 0 {
-                log::info!(
-                    "diff without order (sample 1/1000): {kind} oid={} coin={} height={height}",
-                    oid.value(),
-                    coin.value()
-                );
-            }
+        // A counter says how many; it takes an oid to find out what they are
+        // (tools/diff-orphans.py --oids). One in a thousand of each, at info,
+        // is enough to sample from and cannot flood the log. `unknown` is the
+        // outcome that may hide a loss; `pending_dropped` is sampled so the
+        // drop itself can be checked against the files -- an order re-placed
+        // under the same oid after its Remove would be dropped wrongly.
+        static UNKNOWN_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static DROPPED_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let counter = match outcome {
+            "unknown" => &UNKNOWN_SEEN,
+            "pending_dropped" => &DROPPED_SEEN,
+            _ => return,
+        };
+        if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1000 == 0 {
+            log::info!(
+                "diff without order (sample 1/1000): {kind} {outcome} oid={} coin={} height={height}",
+                oid.value(),
+                coin.value()
+            );
         }
     }
 }
