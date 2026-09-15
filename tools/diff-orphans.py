@@ -196,9 +196,9 @@ def read_oids(path):
     out = []
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
-            m = re.search(r"oid=(\d+)", line)
-            if m:
-                out.append(int(m.group(1)))
+            found = re.findall(r"oid=(\d+)", line)
+            if found:
+                out.extend(int(x) for x in found)
                 continue
             line = line.strip()
             if line.isdigit():

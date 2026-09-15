@@ -276,34 +276,77 @@ impl OrderBookState {
 
         let mut cleared = false;
 
+        // A few of the evicted are named in the log line, as `oid=N`, so they
+        // can be traced in the node's files (tools/diff-orphans.py --oids):
+        // an eviction is a count, and only the oid says which orders these
+        // are and why their other half never came.
+        const SAMPLE: usize = 5;
+
         let before = self.pending_order_statuses.len();
-        self.pending_order_statuses.retain(|_, (_, at)| at.elapsed() < PENDING_MAX_AGE);
+        let mut sample = Vec::new();
+        self.pending_order_statuses.retain(|oid, (status, at)| {
+            let keep = at.elapsed() < PENDING_MAX_AGE;
+            if !keep && sample.len() < SAMPLE {
+                sample.push(format!(
+                    "oid={} {} {} trigger={} tif={}",
+                    oid.value(),
+                    status.order.coin,
+                    status.status,
+                    status.order.is_trigger,
+                    status.order.tif.as_deref().unwrap_or("-")
+                ));
+            }
+            keep
+        });
         let aged_statuses = before - self.pending_order_statuses.len();
         if aged_statuses > 0 {
             // Expected orphans (order never rested -> no New diff): not data loss.
-            log::info!("Evicted {aged_statuses} aged pending_order_statuses entries (no matching BookDiff)");
+            log::info!(
+                "Evicted {aged_statuses} aged pending_order_statuses entries (no matching BookDiff); e.g. {}",
+                sample.join(", ")
+            );
         }
 
         let before = self.pending_new_diffs.len();
-        self.pending_new_diffs.retain(|_, (_, _, at)| at.elapsed() < PENDING_MAX_AGE);
+        let mut sample = Vec::new();
+        self.pending_new_diffs.retain(|oid, (_, _, at)| {
+            let keep = at.elapsed() < PENDING_MAX_AGE;
+            if !keep && sample.len() < SAMPLE {
+                sample.push(format!("oid={}", oid.value()));
+            }
+            keep
+        });
         let aged_diffs = before - self.pending_new_diffs.len();
         if aged_diffs > 0 {
             // A New diff with no status in 60s: the order is missing from the book.
-            log::warn!("Evicted {aged_diffs} aged pending_new_diffs entries (status never arrived - data loss)");
+            log::warn!(
+                "Evicted {aged_diffs} aged pending_new_diffs entries (status never arrived - data loss); e.g. {}",
+                sample.join(", ")
+            );
             cleared = true;
         }
 
         if self.pending_order_statuses.len() > MAX_PENDING_ORDERS {
+            let sample: Vec<String> = self.pending_order_statuses.iter().take(SAMPLE)
+                .map(|(oid, (st, _))| format!("oid={} {} {}", oid.value(), st.order.coin, st.status))
+                .collect();
             log::warn!(
-                "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs)",
-                self.pending_order_statuses.len()
+                "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs); e.g. {}",
+                self.pending_order_statuses.len(),
+                sample.join(", ")
             );
             self.pending_order_statuses = rustc_hash::FxHashMap::default();
             cleared = true;
         }
 
         if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
-            log::warn!("Clearing stale pending_new_diffs cache: {} entries", self.pending_new_diffs.len());
+            let sample: Vec<String> =
+                self.pending_new_diffs.keys().take(SAMPLE).map(|oid| format!("oid={}", oid.value())).collect();
+            log::warn!(
+                "Clearing stale pending_new_diffs cache: {} entries; e.g. {}",
+                self.pending_new_diffs.len(),
+                sample.join(", ")
+            );
             self.pending_new_diffs = rustc_hash::FxHashMap::default();
             cleared = true;
         }
