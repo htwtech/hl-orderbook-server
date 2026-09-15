@@ -635,7 +635,8 @@ mod tests {
         use crate::types::subscription::MAX_LEVELS;
         let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
         let mut oid = 0u64;
-        // More than MAX_LEVELS raw bid levels packed within ~$120 of the mid...
+        // More than MAX_LEVELS raw bid levels packed one tick apart below the mid...
+        let top_bid = 64_931 + MAX_LEVELS + 20 - 1;
         for i in 0..(MAX_LEVELS + 20) {
             books.add_order(order(oid, "BTC", Side::Bid, "1", &format!("{}", 64_931 + i)));
             oid += 1;
@@ -645,14 +646,17 @@ mod tests {
             books.add_order(order(oid, "BTC", Side::Bid, "1", &format!("{deep_px}")));
             oid += 1;
         }
-        books.add_order(order(oid, "BTC", Side::Ask, "1", "65100"));
+        // The ask must not cross the top bid: add_order matches, and a fill
+        // would take a unit of bid liquidity out before aggregation runs.
+        books.add_order(order(oid, "BTC", Side::Ask, "1", &format!("{}", top_bid + 50)));
 
         let mut active = HashSet::new();
         active.insert(L2SnapshotParams::new(Some(2), None));
         let variants = compute_l2_variants_for_coin(books.as_ref().get(&Coin::new("BTC")).unwrap(), &active);
         let [bids, _] = variants.get(&L2SnapshotParams::new(Some(2), None)).unwrap().as_ref();
 
-        // 64931..=65050 buckets to {65000, 64000}; the deep levels add 4 more.
+        // 64931..=top_bid buckets to {65000, 64000} (the packed range stays
+        // below 66000 for any MAX_LEVELS up to 1049); the deep levels add 4 more.
         assert_eq!(bids.len(), 6, "coarse buckets must cover the full book depth, got {bids:?}");
         let total_sz: u64 = bids.iter().map(|l| l.sz.value()).sum();
         let expected_sz = Sz::parse_from_str(&format!("{}", MAX_LEVELS + 24)).unwrap().value();
