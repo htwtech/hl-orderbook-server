@@ -463,7 +463,7 @@ curl http://localhost:9090/metrics
 | | `channel_drops_total` | Messages dropped due to lag |
 | | `broadcast_channel_lag` | Broadcast channel lag (receivers behind) |
 | | `orderbook_desyncs_total{reason}` | Times the book was marked out-of-sync (each triggers an automatic background snapshot re-fetch). Alert on a sustained rate; occasional self-heals are benign |
-| | `orderbook_diff_without_order_total{kind,outcome}` | Update/Remove diffs with no resting order: `pending_dropped` / `pending_updated` were applied to the order's waiting New (would have been phantoms before); `unknown` found nothing at all |
+| | `orderbook_diff_without_order_total{kind,outcome}` | Update/Remove diffs with no resting order: `pending_dropped` / `pending_updated` were applied to the order's waiting New (would have been phantoms before); `after_zero` is the Remove the node sends after emptying an order with an Update to zero (a full fill, expected); `unknown` found nothing at all |
 
 ### Disable Metrics
 

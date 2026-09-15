@@ -34,6 +34,12 @@ pub(super) struct OrderBookState {
     // the level). Drained per batch by the listener, which converts a nonzero count into
     // a desync mark + Prometheus counter. Sticky across snapshot replay on purpose.
     insert_before_fallbacks: u64,
+    // Orders emptied by an Update to zero, by block. On a full fill the node
+    // writes that update and then a Remove for the same oid in the same block;
+    // the Remove finds nothing, and that is expected -- kept apart from a
+    // Remove that is unknown for real. Cleared as the diff stream moves on to
+    // the next block.
+    zeroed_in_block: (u64, rustc_hash::FxHashSet<Oid>),
     // Untriggered trigger orders (stop / TP-SL waiting for triggerPx to be crossed),
     // keyed per coin so single-coin queries and bogus-coin probes never scan the
     // whole set. These never rest on the book: the hl-node snapshot appends them to
@@ -103,6 +109,7 @@ impl OrderBookState {
             pending_order_statuses: rustc_hash::FxHashMap::default(),
             pending_new_diffs: rustc_hash::FxHashMap::default(),
             insert_before_fallbacks: 0,
+            zeroed_in_block: (0, rustc_hash::FxHashSet::default()),
             untriggered_orders,
             track_untriggered,
         }
@@ -432,6 +439,9 @@ impl OrderBookState {
         let height = batch.block_number();
         let time = batch.block_time();
         let mut changed_coins = HashSet::new();
+        if self.zeroed_in_block.0 != height {
+            self.zeroed_in_block = (height, rustc_hash::FxHashSet::default());
+        }
 
         // Update height/time to track progress (>= ensures time updates even at same height)
         if height >= self.height {
@@ -478,14 +488,22 @@ impl OrderBookState {
                 // its status finally arrived -- a phantom the book kept forever,
                 // since nothing marked it as a loss.
                 InnerOrderDiff::Update { new_sz, .. } => {
-                    if !self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
+                    if self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
+                        if new_sz.value() == 0 {
+                            self.zeroed_in_block.1.insert(oid.clone());
+                        }
+                    } else {
                         self.apply_diff_to_pending_new(&oid, "update", Some(new_sz));
                     }
                     changed_coins.insert(coin);
                 }
                 InnerOrderDiff::Remove => {
                     if !self.order_book.cancel_order(oid.clone(), coin.clone()) {
-                        self.apply_diff_to_pending_new(&oid, "remove", None);
+                        if self.zeroed_in_block.1.remove(&oid) {
+                            crate::metrics::DIFF_WITHOUT_ORDER_TOTAL.with_label_values(&["remove", "after_zero"]).inc();
+                        } else {
+                            self.apply_diff_to_pending_new(&oid, "remove", None);
+                        }
                     }
                     changed_coins.insert(coin);
                 }
@@ -1047,6 +1065,28 @@ mod tests {
         let status = make_order_status("BTC", 9, "open");
         state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
         assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_after_an_update_to_zero_is_expected() {
+        let mut state = empty_state();
+        let status = make_order_status("BTC", 11, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let new = make_order_diff("BTC", 11, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        assert_eq!(state.order_count(), 1);
+
+        // A full fill: the node empties the order, then removes it, same block
+        // (every test batch is block 100).
+        let zero = make_order_diff("BTC", 11, OrderDiff::Update { orig_sz: "1.0".to_string(), new_sz: "0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![zero])).unwrap();
+        assert_eq!(state.order_count(), 0);
+        assert!(state.zeroed_in_block.1.contains(&Oid::new(11)), "the zeroing is remembered for the block");
+
+        let remove = make_order_diff("BTC", 11, OrderDiff::Remove);
+        state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
+        assert!(!state.zeroed_in_block.1.contains(&Oid::new(11)), "the Remove was recognised as the follow-up, not unknown");
+        assert_eq!(state.pending_new_diffs_count(), 0);
     }
 
     #[test]

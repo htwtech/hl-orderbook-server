@@ -14,11 +14,12 @@ alone ("orphan"), looks the oid up in the status file of that hour and classifie
   already gone by X, then Y  the diffs themselves had removed it (a size
                              update to zero, or an earlier Remove); benign
   ioc                        tif=Ioc: never rests
-  terminal status only       filled/canceled/... this hour, no "open": the
-                             order was a taker or was placed before this hour
-  no status this hour        placed before this hour -- the book has it from
-                             the snapshot; a live server should not find it
-                             unknown
+  placed before this hour    only a terminal status this hour (canceled /
+                             filled / ...), or no status at all: the New was
+                             in an earlier hour, outside this replay. The
+                             server holds such orders from its snapshot and
+                             finds them -- an artifact of the one-hour window,
+                             not something the server counts as unknown
   opened this hour, no New   "open" this hour but no New diff before the
                              Remove: this is the suspicious one
 
@@ -163,7 +164,7 @@ def classify(kind, gone_by, statuses):
     if gone_by:
         return "already gone by " + gone_by + ", then " + kind
     if not statuses:
-        return "no status this hour"
+        return "placed before this hour (no status this hour)"
     names = [s for _, s, _ in statuses]
     order = statuses[0][2]
     if order.get("tif") == "Ioc":
@@ -172,7 +173,7 @@ def classify(kind, gone_by, statuses):
         return "trigger, never triggered"
     if "open" in names:
         return "opened this hour, no New before the " + kind
-    return "terminal status only (" + ", ".join(sorted(set(names))) + ")"
+    return "placed before this hour (only " + ", ".join(sorted(set(names))) + " this hour)"
 
 
 def main():

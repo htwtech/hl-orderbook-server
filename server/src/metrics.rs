@@ -212,7 +212,9 @@ lazy_static! {
     /// became of them: `pending_dropped` / `pending_updated` -- the order's New
     /// was still waiting for its status (the diffs ran ahead) and was fixed up,
     /// which before this counter existed left a phantom order in the book;
-    /// `unknown` -- neither resting nor waiting, a loss of some other kind.
+    /// `after_zero` -- the Remove the node writes after emptying an order with
+    /// an Update to zero (a full fill), expected; `unknown` -- neither resting,
+    /// waiting nor just emptied: a loss of some other kind.
     pub static ref DIFF_WITHOUT_ORDER_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new("orderbook_diff_without_order_total", "Update/Remove diffs for orders not in the book, by what was done with them"),
         &["kind", "outcome"]
