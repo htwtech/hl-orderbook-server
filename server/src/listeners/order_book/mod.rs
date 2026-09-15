@@ -1652,52 +1652,53 @@ impl Drop for ActiveSubGuard {
 /// 1. 3 dedicated threads for file watching (parallel I/O)
 /// 2. Processes OrderDiffs immediately (doesn't wait for OrderStatuses)
 /// 3. Uses process time instead of block time for lowest latency
-/// How far one book stream may run ahead of the other, in blocks, before its
-/// batches are held back. Zero to two in steady state (see
-/// `orderbook_stream_skew_blocks`), so this never engages there.
-const SKEW_GATE_BLOCKS: u64 = 32;
-/// A held stream is let through once this many of its batches have arrived
-/// while the other stream delivered none at all: the other stream is dead,
-/// the watchdog's case, and the book must not freeze behind it. Counted in
-/// batches rather than seconds on purpose -- the listener itself pauses for
-/// seconds under load, and a clock would call every such pause a death.
-const SKEW_GATE_STALL_BATCHES: u64 = 10_000;
-/// Held batches are small (a line is one or two events) but the backlog after
-/// a long stall is not; past this many, release regardless.
-const SKEW_GATE_MAX_HELD: usize = 200_000;
+/// When one book stream has nothing queued, how far past its last delivered
+/// height the other may be applied. A few blocks of halves waiting for their
+/// other half is nothing; thousands is what overran the pending caches.
+const MERGE_LOOKAHEAD_BLOCKS: u64 = 32;
+/// A stream that has delivered nothing while the other advanced this many
+/// blocks is dead -- the watchdog's case -- and the book follows the live one
+/// rather than freezing. Blocks, not seconds: the listener itself pauses under
+/// load, and a clock would call every pause a death.
+const MERGE_STALL_BLOCKS: u64 = 600;
+/// Queued batches are small (a line is one or two events), but a reader far
+/// behind the other after a long stall is not; past this many, apply anyway.
+const MERGE_MAX_QUEUED: usize = 500_000;
 
-/// Keeps the two book streams within SKEW_GATE_BLOCKS of each other.
+/// Applies the two book streams in block order, whichever thread read them.
 ///
-/// The status and diff files are read by independent threads and applied as
-/// they arrive. In steady state they stay within a block or two. After a stall
-/// -- a snapshot install, a slow flush -- both readers catch up in fixed-size
-/// chunks, and a chunk of diffs covers several times the blocks a chunk of
-/// statuses does, so one stream pulls thousands of blocks ahead. Every New in
-/// that stretch then waits for a status still on disk (or every status for a
-/// New), the pending cache overruns its cap, and what overruns is lost. Measured
-/// on mainnet: ten thousand New diffs thrown away per second, every second, for
-/// several seconds after each install -- and every one of them a hole in the
-/// book. Holding the stream that is ahead bounds the wait to a few blocks.
+/// The status and diff files are read by independent threads and used to be
+/// applied as they arrived. In steady state that is within a block or two of
+/// block order. After a stall -- a snapshot install, a slow flush -- both
+/// readers catch up in fixed-size chunks, and a chunk of diffs covers several
+/// times the blocks a chunk of statuses does, so one stream ran thousands of
+/// blocks ahead: every New in that stretch waited for a status still on disk
+/// (or every status for a New), the pending caches overran their caps, and
+/// what overran was lost. Measured on mainnet: ten thousand New diffs thrown
+/// away per second for several seconds after each install, each one a hole.
 ///
-/// A held stream is not a stopped one. The first version released held
-/// batches after two seconds of the *other* stream not advancing -- but a
-/// held stream does not advance either, and while the listener applied one
-/// mass release the other side looked stopped in turn: a two-second seesaw
-/// that ran the skew to 1 500 blocks and the pending caches past their caps.
-/// Now only delivery counts: a stream is stopped when the other has delivered
-/// SKEW_GATE_STALL_BATCHES batches and it has delivered none.
-struct SkewGate {
-    /// Highest height applied from [statuses, diffs].
-    frontier: [u64; 2],
-    /// Batches delivered by each stream since the other last delivered one.
-    since_other: [u64; 2],
-    /// Batches held back, per stream, in arrival order.
-    held: [VecDeque<(u64, EventBatch)>; 2],
+/// So the streams are merged: each is queued, and the batch with the lower
+/// block height is applied first, a status before a diff of the same block.
+/// While both queues have something this is exactly the node's own order and
+/// nothing waits. Only a lone queue -- the other stream has delivered nothing
+/// newer yet -- is held, and only past MERGE_LOOKAHEAD_BLOCKS beyond the
+/// other's last delivered height.
+///
+/// (An earlier version held whichever stream was ahead of the other's applied
+/// frontier. With both held nothing could advance, and the escape hatches --
+/// "the other has stopped", "too many held" -- released blindly and in bulk:
+/// 200 000 batches queued, a 2 400-block skew, both pending caches over their
+/// caps. Merging by height has no such state: the lower head always applies.)
+struct StreamMerge {
+    /// Queued batches per stream [statuses, diffs], in arrival order.
+    queues: [VecDeque<(u64, EventBatch)>; 2],
+    /// Highest height delivered by each stream, applied or still queued.
+    seen: [u64; 2],
 }
 
-impl SkewGate {
+impl StreamMerge {
     fn new() -> Self {
-        Self { frontier: [0, 0], since_other: [0, 0], held: [VecDeque::new(), VecDeque::new()] }
+        Self { queues: [VecDeque::new(), VecDeque::new()], seen: [0, 0] }
     }
 
     const fn slot(source: EventSource) -> Option<usize> {
@@ -1708,58 +1709,54 @@ impl SkewGate {
         }
     }
 
+    const fn source(slot: usize) -> EventSource {
+        if slot == 0 { EventSource::OrderStatuses } else { EventSource::OrderDiffs }
+    }
+
     /// Offer a live batch; returns everything that may be applied now, in order.
     fn offer(&mut self, height: u64, batch: EventBatch, source: EventSource) -> Vec<(u64, EventBatch, EventSource)> {
         let Some(me) = Self::slot(source) else { return vec![(height, batch, source)] };
-        let other = 1 - me;
-        self.since_other[me] += 1;
-        self.since_other[other] = 0;
-        // Until both streams have spoken there is nothing to be ahead of.
-        let ahead = self.frontier[other] > 0 && height > self.frontier[other] + SKEW_GATE_BLOCKS;
+        self.seen[me] = self.seen[me].max(height);
+        self.queues[me].push_back((height, batch));
+        self.drain()
+    }
+
+    fn drain(&mut self) -> Vec<(u64, EventBatch, EventSource)> {
         let mut out = Vec::new();
-        if ahead || !self.held[me].is_empty() {
-            // Behind anything already held from this stream: order must hold.
-            self.held[me].push_back((height, batch));
-        } else {
-            self.frontier[me] = self.frontier[me].max(height);
-            out.push((height, batch, source));
+        loop {
+            let heads = [self.queues[0].front().map(|(h, _)| *h), self.queues[1].front().map(|(h, _)| *h)];
+            let me = match heads {
+                // Both have something: the lower block first, a status before
+                // a diff of the same block.
+                [Some(hs), Some(hd)] => {
+                    if hs <= hd { 0 } else { 1 }
+                }
+                // One stream alone: everything the other delivered is applied,
+                // so its last delivered height is where it stands. Apply a
+                // little past that, wait beyond -- unless it is dead, or the
+                // backlog is too big to keep.
+                [Some(h), None] | [None, Some(h)] => {
+                    let me = if heads[0].is_some() { 0 } else { 1 };
+                    let other = 1 - me;
+                    let other_spoke = self.seen[other] > 0;
+                    let within = !other_spoke || h <= self.seen[other] + MERGE_LOOKAHEAD_BLOCKS;
+                    let dead = other_spoke && self.seen[me] > self.seen[other] + MERGE_STALL_BLOCKS;
+                    let too_many = self.queues[me].len() > MERGE_MAX_QUEUED;
+                    if !(within || dead || too_many) {
+                        break;
+                    }
+                    me
+                }
+                [None, None] => break,
+            };
+            let Some((h, b)) = self.queues[me].pop_front() else { break };
+            out.push((h, b, Self::source(me)));
         }
-        self.release(&mut out);
         out
     }
 
-    /// Release held batches that are now within reach of the other stream, or
-    /// whose other stream has stopped delivering, or that are simply too many.
-    /// Each release may advance a frontier and free the other side in turn, so
-    /// loop to a fixpoint.
-    fn release(&mut self, out: &mut Vec<(u64, EventBatch, EventSource)>) {
-        loop {
-            let mut moved = false;
-            for me in 0..2 {
-                let other = 1 - me;
-                let source = if me == 0 { EventSource::OrderStatuses } else { EventSource::OrderDiffs };
-                let other_stopped = self.since_other[me] >= SKEW_GATE_STALL_BATCHES;
-                while let Some((h, _)) = self.held[me].front() {
-                    let due = *h <= self.frontier[other] + SKEW_GATE_BLOCKS
-                        || other_stopped
-                        || self.held[me].len() > SKEW_GATE_MAX_HELD;
-                    if !due {
-                        break;
-                    }
-                    let Some((h, b)) = self.held[me].pop_front() else { break };
-                    self.frontier[me] = self.frontier[me].max(h);
-                    out.push((h, b, source));
-                    moved = true;
-                }
-            }
-            if !moved {
-                break;
-            }
-        }
-    }
-
-    fn held_count(&self) -> usize {
-        self.held[0].len() + self.held[1].len()
+    fn queued(&self) -> usize {
+        self.queues[0].len() + self.queues[1].len()
     }
 }
 
@@ -1843,7 +1840,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         Desync,
     }
 
-    let mut gate = SkewGate::new();
+    let mut merge = StreamMerge::new();
 
     // The initial snapshot waits for both book backfills: installing it takes
     // the replay cache away, and every backfill line still in flight would be
@@ -1899,7 +1896,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             continue;
                         }
                         parallel::FileEvent::BackfillDone(source) => {
-                            if let Some(slot) = SkewGate::slot(source) {
+                            if let Some(slot) = StreamMerge::slot(source) {
                                 backfills_done[slot] = true;
                             }
                             if backfills_done.iter().all(|&d| d) {
@@ -1914,15 +1911,15 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             // snapshot height, never applied to a live book.
                             actions.push(Action::Backfill(batch));
                         } else {
-                            // Live batches pass through the skew gate, which
-                            // may hold this one or release earlier ones.
-                            for (h, b, s) in gate.offer(height, batch, source) {
+                            // Live batches go through the merge, which applies
+                            // them in block order across the two streams.
+                            for (h, b, s) in merge.offer(height, batch, source) {
                                 actions.push(Action::Apply(h, b, s));
                             }
                         }
                     }
                 }
-                SKEW_GATE_HELD.set(gate.held_count() as i64);
+                SKEW_GATE_HELD.set(merge.queued() as i64);
                 if !actions.is_empty() {
                     let lock_start = Instant::now();
                     let mut guard = listener.lock().await;
@@ -3045,7 +3042,7 @@ mod tests {
         assert!(reg.snapshot().is_empty());
     }
 
-    // ==================== Skew gate ====================
+    // ==================== Stream merge ====================
 
     fn statuses_at(height: u64) -> EventBatch {
         EventBatch::Orders(make_status_batch("BTC", height, height))
@@ -3055,102 +3052,90 @@ mod tests {
         EventBatch::BookDiffs(make_diff_batch("BTC", height, height, serde_json::json!("remove")))
     }
 
-    /// (height, stream) of what the gate let through.
+    /// (height, stream) of what the merge let through.
     fn passed(out: &[(u64, EventBatch, EventSource)]) -> Vec<(u64, &'static str)> {
         out.iter().map(|(h, _, s)| (*h, s.metric_label())).collect()
     }
 
     #[test]
-    fn skew_gate_passes_streams_that_stay_in_step() {
-        let mut gate = SkewGate::new();
+    fn merge_passes_streams_that_stay_in_step() {
+        let mut m = StreamMerge::new();
         for h in 100..110 {
-            assert_eq!(passed(&gate.offer(h, statuses_at(h), EventSource::OrderStatuses)), vec![(h, "orders")]);
-            assert_eq!(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)), vec![(h, "diffs")]);
+            assert_eq!(passed(&m.offer(h, statuses_at(h), EventSource::OrderStatuses)), vec![(h, "orders")]);
+            assert_eq!(passed(&m.offer(h, diffs_at(h), EventSource::OrderDiffs)), vec![(h, "diffs")]);
         }
-        assert_eq!(gate.held_count(), 0);
+        assert_eq!(m.queued(), 0);
     }
 
     #[test]
-    fn skew_gate_holds_the_stream_that_runs_ahead_and_releases_it_in_order() {
-        let mut gate = SkewGate::new();
-        gate.offer(100, statuses_at(100), EventSource::OrderStatuses);
-        // Diffs race ahead: up to 100 + 32 pass, the rest wait.
+    fn merge_applies_by_block_a_status_before_a_diff_of_the_same_block() {
+        let mut m = StreamMerge::new();
+        m.offer(100, statuses_at(100), EventSource::OrderStatuses);
+        // Diffs race 100 blocks ahead: a few pass on the lookahead, the rest queue.
         let mut through = Vec::new();
-        for h in 100..=150 {
-            through.extend(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)));
+        for h in 100..=200 {
+            through.extend(passed(&m.offer(h, diffs_at(h), EventSource::OrderDiffs)));
         }
         assert_eq!(through.last(), Some(&(132, "diffs")));
-        assert_eq!(gate.held_count(), 18, "133..=150 held");
+        assert_eq!(m.queued(), 68, "133..=200 queued");
 
-        // Statuses catch up block by block; each one frees the diffs it brings within reach.
-        let out = gate.offer(101, statuses_at(101), EventSource::OrderStatuses);
-        assert_eq!(passed(&out), vec![(101, "orders"), (133, "diffs")]);
-        let out = gate.offer(110, statuses_at(110), EventSource::OrderStatuses);
-        assert_eq!(passed(&out), vec![(110, "orders")].into_iter().chain((134..=142).map(|h| (h, "diffs"))).collect::<Vec<_>>());
-        let out = gate.offer(130, statuses_at(130), EventSource::OrderStatuses);
-        assert_eq!(passed(&out), vec![(130, "orders")].into_iter().chain((143..=150).map(|h| (h, "diffs"))).collect::<Vec<_>>());
-        assert_eq!(gate.held_count(), 0);
-
-        // A block has many lines. A second batch at 163 arriving while the first
-        // is held must queue behind everything held, not jump the line.
-        for h in 151..=170 {
-            gate.offer(h, diffs_at(h), EventSource::OrderDiffs);
-        }
-        assert_eq!(gate.held_count(), 8, "163..=170 held behind statuses at 130");
-        assert!(passed(&gate.offer(163, diffs_at(163), EventSource::OrderDiffs)).is_empty());
-        let out = gate.offer(131, statuses_at(131), EventSource::OrderStatuses);
-        assert_eq!(passed(&out), vec![(131, "orders"), (163, "diffs")], "only the first 163 is within reach");
-        assert_eq!(gate.held_count(), 8, "the second 163 waits its turn behind 170");
+        // A status for 133 goes first, then the diffs of 133 -- and, the
+        // statuses being alone again, the diffs up to 133 + 32 on the lookahead.
+        let out = m.offer(133, statuses_at(133), EventSource::OrderStatuses);
+        assert_eq!(passed(&out), [(133, "orders")].into_iter().chain((133..=165).map(|h| (h, "diffs"))).collect::<Vec<_>>());
+        assert_eq!(m.queued(), 35, "166..=200 still queued");
+        // The status for 140 is the lower head: it goes before any queued diff,
+        // then the lookahead moves on to 172.
+        let out = m.offer(140, statuses_at(140), EventSource::OrderStatuses);
+        assert_eq!(passed(&out), [(140, "orders")].into_iter().chain((166..=172).map(|h| (h, "diffs"))).collect::<Vec<_>>());
+        assert_eq!(m.queued(), 28);
     }
 
     #[test]
-    fn skew_gate_is_symmetric() {
-        let mut gate = SkewGate::new();
-        gate.offer(100, diffs_at(100), EventSource::OrderDiffs);
+    fn merge_holds_a_lone_stream_only_past_the_lookahead() {
+        let mut m = StreamMerge::new();
+        m.offer(100, diffs_at(100), EventSource::OrderDiffs);
         for h in 100..=140 {
-            gate.offer(h, statuses_at(h), EventSource::OrderStatuses);
+            m.offer(h, statuses_at(h), EventSource::OrderStatuses);
         }
-        assert_eq!(gate.held_count(), 8, "statuses 133..=140 held behind the diffs");
-        let out = gate.offer(110, diffs_at(110), EventSource::OrderDiffs);
-        assert_eq!(passed(&out), vec![(110, "diffs")].into_iter().chain((133..=140).map(|h| (h, "orders"))).collect::<Vec<_>>());
+        assert_eq!(m.queued(), 8, "statuses 133..=140 wait for the diffs to catch up");
+        // The diffs deliver 101: it is the lower head and goes first; that
+        // brings exactly one status, 133, within 101 + 32.
+        let out = m.offer(101, diffs_at(101), EventSource::OrderDiffs);
+        assert_eq!(passed(&out), vec![(101, "diffs"), (133, "orders")]);
+        assert_eq!(m.queued(), 7);
+        // 108 brings the rest within reach.
+        let out = m.offer(108, diffs_at(108), EventSource::OrderDiffs);
+        assert_eq!(passed(&out), [(108, "diffs")].into_iter().chain((134..=140).map(|h| (h, "orders"))).collect::<Vec<_>>());
+        assert_eq!(m.queued(), 0);
     }
 
     #[test]
-    fn skew_gate_releases_only_behind_a_stream_that_stopped_delivering() {
-        let mut gate = SkewGate::new();
-        gate.offer(100, statuses_at(100), EventSource::OrderStatuses);
-        assert!(passed(&gate.offer(200, diffs_at(200), EventSource::OrderDiffs)).is_empty());
-
-        // Statuses keep coming, however slowly and however far behind: the held
-        // diff keeps waiting. Being held is not being stopped.
-        for _ in 0..3 {
-            for h in 201..(201 + SKEW_GATE_STALL_BATCHES / 2) {
-                assert!(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)).is_empty());
-            }
-            assert_eq!(passed(&gate.offer(101, statuses_at(101), EventSource::OrderStatuses)), vec![(101, "orders")]);
+    fn merge_follows_a_stream_whose_partner_has_died() {
+        let mut m = StreamMerge::new();
+        m.offer(100, statuses_at(100), EventSource::OrderStatuses);
+        let mut through = Vec::new();
+        for h in 101..=(100 + MERGE_STALL_BLOCKS) {
+            through.extend(passed(&m.offer(h, diffs_at(h), EventSource::OrderDiffs)));
         }
-        assert!(gate.held_count() > 0);
-
-        // Then the statuses stop for good: after STALL_BATCHES diffs with no
-        // status among them, the diffs go through, in order.
-        let mut released = Vec::new();
-        for h in 1000..(1000 + SKEW_GATE_STALL_BATCHES) {
-            released.extend(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)));
-        }
-        assert_eq!(released.first(), Some(&(200, "diffs")), "the first held goes first");
-        assert_eq!(gate.held_count(), 0, "everything held went through");
-        // ...and stays open while the statuses stay silent.
-        assert_eq!(passed(&gate.offer(5000, diffs_at(5000), EventSource::OrderDiffs)), vec![(5000, "diffs")]);
+        assert_eq!(through.last(), Some(&(132, "diffs")), "waited past the lookahead");
+        assert!(m.queued() > 0);
+        // One block past the stall bound the statuses are declared dead and
+        // the diffs go through, in order, and keep going.
+        let out = m.offer(101 + MERGE_STALL_BLOCKS, diffs_at(101 + MERGE_STALL_BLOCKS), EventSource::OrderDiffs);
+        assert_eq!(passed(&out).first(), Some(&(133, "diffs")));
+        assert_eq!(m.queued(), 0);
+        assert_eq!(passed(&m.offer(5000, diffs_at(5000), EventSource::OrderDiffs)), vec![(5000, "diffs")]);
     }
 
     #[test]
-    fn skew_gate_does_not_engage_until_both_streams_have_spoken() {
-        let mut gate = SkewGate::new();
+    fn merge_does_not_engage_until_both_streams_have_spoken() {
+        let mut m = StreamMerge::new();
         for h in 1..=100 {
-            assert_eq!(passed(&gate.offer(h, diffs_at(h), EventSource::OrderDiffs)), vec![(h, "diffs")]);
+            assert_eq!(passed(&m.offer(h, diffs_at(h), EventSource::OrderDiffs)), vec![(h, "diffs")]);
         }
-        // Fills are never held.
+        // Fills are never queued.
         let fills = EventBatch::Fills(make_fills_batch(&["BTC"], 500));
-        assert_eq!(passed(&gate.offer(500, fills, EventSource::Fills)), vec![(500, "fills")]);
+        assert_eq!(passed(&m.offer(500, fills, EventSource::Fills)), vec![(500, "fills")]);
     }
 }
