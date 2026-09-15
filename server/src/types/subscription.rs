@@ -204,7 +204,7 @@ mod test {
     use crate::types::node_data::NodeDataOrderDiff;
     use crate::types::subscription::Subscription;
 
-    use super::{ClientMessage, ServerResponse};
+    use super::{ClientMessage, MAX_LEVELS, ServerResponse};
 
     #[test]
     fn test_message_deserialization_subscription_response() {
