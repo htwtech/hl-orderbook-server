@@ -1768,7 +1768,7 @@ impl LiveMerge {
     /// Up to MERGE_TAKE batches in block order, waiting as long as none can be
     /// applied. Cancel-safe: whatever was taken before a cancellation is
     /// handed out by the next call. `Err` means a book channel closed.
-    async fn take(&mut self) -> Result<Vec<(u64, EventBatch, EventSource)>, ()> {
+    async fn take(&mut self) -> std::result::Result<Vec<(u64, EventBatch, EventSource)>, ()> {
         loop {
             if self.ready.len() >= MERGE_TAKE {
                 return Ok(std::mem::take(&mut self.ready));
@@ -1795,7 +1795,7 @@ impl LiveMerge {
     /// Nothing can be applied: wait for a line that can change that. With one
     /// head waiting on the other stream, that is the other's channel, with a
     /// deadline past which the other is dead; with both empty, either channel.
-    async fn wait(&mut self) -> Result<(), ()> {
+    async fn wait(&mut self) -> std::result::Result<(), ()> {
         let waiting_on = match (&self.peek[0], &self.peek[1]) {
             (Some(_), None) => Some(1),
             (None, Some(_)) => Some(0),
