@@ -1845,6 +1845,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
 
     let mut gate = SkewGate::new();
 
+    // The initial snapshot waits for both book backfills: installing it takes
+    // the replay cache away, and every backfill line still in flight would be
+    // dropped. No backfill means nothing to wait for.
+    let mut backfills_done: [bool; 2] = [backfill_min_height == 0; 2];
+
     info!("Main event loop starting");
 
     loop {
@@ -1891,6 +1896,15 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             // the book can no longer be trusted - trigger a re-sync.
                             error!("{source} watcher reported data loss");
                             actions.push(Action::Desync);
+                            continue;
+                        }
+                        parallel::FileEvent::BackfillDone(source) => {
+                            if let Some(slot) = SkewGate::slot(source) {
+                                backfills_done[slot] = true;
+                            }
+                            if backfills_done.iter().all(|&d| d) {
+                                info!("Both book backfills complete; the initial snapshot may be installed");
+                            }
                             continue;
                         }
                     };
@@ -1991,8 +2005,9 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 // an urgent desync (data loss, fallback burst, or a fallback
                 // that waited out the coalescing window) AND the backoff
                 // spacing to have elapsed.
-                let fetch_due =
-                    !is_ready || (needs_resync && resync_urgent && Instant::now() >= next_fetch_allowed);
+                let backfill_ready = backfills_done.iter().all(|&d| d);
+                let fetch_due = (!is_ready && backfill_ready)
+                    || (needs_resync && resync_urgent && Instant::now() >= next_fetch_allowed);
                 if fetch_due && !snapshot_fetch_pending {
                     snapshot_fetch_pending = true;
                     let listener = listener.clone();

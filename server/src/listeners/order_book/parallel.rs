@@ -32,6 +32,11 @@ pub(crate) enum FileEvent {
     /// The watcher had to discard buffered data (oversized partial line). The
     /// book may have missed events and must be re-synced from a snapshot.
     Desync(EventSource),
+    /// This source's startup backfill has been sent in full. The initial
+    /// snapshot must not be installed before both book sources have said so:
+    /// an install takes the replay cache away, and backfill lines arriving
+    /// after that were dropped -- 62 457 of them on one start.
+    BackfillDone(EventSource),
 }
 
 /// Cheap block-height extraction without a full JSON parse: streaming lines
@@ -549,6 +554,7 @@ pub(super) fn spawn_file_watcher(
     tx: tokio::sync::mpsc::Sender<FileEvent>,
     last_event: Arc<AtomicU64>,
     backfill_min_height: u64,
+    backfills_done: Option<Arc<AtomicU64>>,
 ) -> thread::JoinHandle<()> {
     let source_name = match source {
         EventSource::OrderStatuses => "OrderStatuses",
@@ -605,6 +611,26 @@ pub(super) fn spawn_file_watcher(
             if reader.take_desynced() && tx.blocking_send(FileEvent::Desync(source)).is_err() {
                 error!("{source_name} channel closed, exiting");
                 return;
+            }
+            if tx.blocking_send(FileEvent::BackfillDone(source)).is_err() {
+                error!("{source_name} channel closed, exiting");
+                return;
+            }
+            // The status file is several times the diff file, so one backfill
+            // ends well before the other. Starting live tracking then would put
+            // the two live streams a whole backfill apart from their first
+            // line -- pending halves ageing out before their other half is even
+            // read. Both book sources start live together instead; the file
+            // keeps growing meanwhile and is read from the recorded cut.
+            if let Some(done) = &backfills_done {
+                let n = done.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                if n < 2 {
+                    info!("{source_name} waiting for the other book stream's backfill before going live");
+                    while done.load(AtomicOrdering::SeqCst) < 2 {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                }
+                info!("{source_name} live tracking starts");
             }
         }
 
@@ -769,6 +795,8 @@ pub(crate) fn start_parallel_file_watchers(
     let last_order_status = Arc::new(AtomicU64::new(0));
     let last_fills = Arc::new(AtomicU64::new(0));
     let last_order_diffs = Arc::new(AtomicU64::new(0));
+    // Book sources whose backfill is done; both must be before either goes live.
+    let backfills_done = Arc::new(AtomicU64::new(0));
 
     // HFT mode uses streaming directories (for --stream-with-block-info)
     // Spawn watcher for OrderStatuses
@@ -780,12 +808,13 @@ pub(crate) fn start_parallel_file_watchers(
         tx.clone(),
         last_order_status.clone(),
         backfill_min_height,
+        Some(backfills_done.clone()),
     ));
 
     // Spawn watcher for Fills (no backfill: fills never mutate the book)
     let fills_dir = EventSource::Fills.event_source_dir_streaming(&data_dir);
     info!("Fills dir: {:?}", fills_dir);
-    handles.push(spawn_file_watcher(EventSource::Fills, fills_dir, tx.clone(), last_fills.clone(), 0));
+    handles.push(spawn_file_watcher(EventSource::Fills, fills_dir, tx.clone(), last_fills.clone(), 0, None));
 
     // Spawn watcher for OrderDiffs
     let order_diffs_dir = EventSource::OrderDiffs.event_source_dir_streaming(&data_dir);
@@ -796,6 +825,7 @@ pub(crate) fn start_parallel_file_watchers(
         tx,
         last_order_diffs.clone(),
         backfill_min_height,
+        Some(backfills_done),
     ));
 
     (rx, handles, last_order_status, last_fills, last_order_diffs)
