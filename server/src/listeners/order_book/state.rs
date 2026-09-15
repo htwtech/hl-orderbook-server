@@ -471,17 +471,55 @@ impl OrderBookState {
                         self.pending_new_diffs.insert(oid.clone(), (sz, insert_before, Instant::now()));
                     }
                 }
+                // An Update or Remove for an order that is not in the book is
+                // not necessarily unknown: its New may still be waiting for the
+                // status, because the diffs run ahead of the statuses. Dropping
+                // the result here (the old `let _ =`) let such an order rest when
+                // its status finally arrived -- a phantom the book kept forever,
+                // since nothing marked it as a loss.
                 InnerOrderDiff::Update { new_sz, .. } => {
-                    let _ = self.order_book.modify_sz(oid, coin.clone(), new_sz);
+                    if !self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
+                        self.apply_diff_to_pending_new(&oid, "update", Some(new_sz));
+                    }
                     changed_coins.insert(coin);
                 }
                 InnerOrderDiff::Remove => {
-                    let _ = self.order_book.cancel_order(oid.clone(), coin.clone());
+                    if !self.order_book.cancel_order(oid.clone(), coin.clone()) {
+                        self.apply_diff_to_pending_new(&oid, "remove", None);
+                    }
                     changed_coins.insert(coin);
                 }
             }
         }
         Ok(changed_coins)
+    }
+
+    /// Carry an Update (`Some(new_sz)`) or Remove (`None`) over to the order's
+    /// New diff still waiting for its status, so that when the status arrives
+    /// the order rests with the right size -- or not at all. The waiting entry
+    /// keeps its original timestamp: the age is measured from the New, and a
+    /// status that never comes must still be noticed by the eviction.
+    fn apply_diff_to_pending_new(&mut self, oid: &Oid, kind: &'static str, new_sz: Option<crate::order_book::Sz>) {
+        let outcome = match new_sz {
+            _ if !self.pending_new_diffs.contains_key(oid) => "unknown",
+            // A size update: the order will rest with this size, not the New's.
+            Some(sz) if sz.value() > 0 => {
+                if let Some(entry) = self.pending_new_diffs.get_mut(oid) {
+                    entry.0 = sz;
+                }
+                "pending_updated"
+            }
+            // A removal, or an update down to nothing: the order is gone before
+            // it ever rested here, and its status must find nothing to pair with.
+            _ => {
+                self.pending_new_diffs.remove(oid);
+                "pending_dropped"
+            }
+        };
+        crate::metrics::DIFF_WITHOUT_ORDER_TOTAL.with_label_values(&[kind, outcome]).inc();
+        if outcome == "unknown" {
+            log::debug!("{kind} diff for oid={oid:?} that is neither resting nor pending");
+        }
     }
 }
 
@@ -938,6 +976,96 @@ mod tests {
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
         assert!(changed.contains(&Coin::new("BTC")));
         assert_eq!(state.order_count(), 0);
+    }
+
+    // ==================== Diffs ahead of statuses ====================
+    //
+    // The two streams are read by independent threads, and the status file is
+    // several times the size of the diff file, so the diffs routinely run ahead.
+    // An order that is placed and removed before its status is read must not
+    // rest in the book once the status finally arrives.
+
+    /// Resting size of the single bid in the coin's book.
+    fn bid_size(state: &OrderBookState, coin: &str) -> crate::order_book::Sz {
+        let (_, _, snapshot) = state.compute_snapshot_for_coin(&Coin::new(coin), PxBand::default()).unwrap();
+        let bids = &snapshot.as_ref()[0];
+        assert_eq!(bids.len(), 1, "expected exactly one resting bid");
+        bids[0].sz()
+    }
+
+    #[test]
+    fn test_remove_before_status_does_not_resurrect_order() {
+        let mut state = empty_state();
+
+        // 1. New diff arrives, status not yet read -> waits
+        let new = make_order_diff("BTC", 7, OrderDiff::New { sz: "5.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        assert_eq!(state.pending_new_diffs_count(), 1);
+
+        // 2. Remove diff arrives: the order is already gone on the chain
+        let remove = make_order_diff("BTC", 7, OrderDiff::Remove);
+        state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
+        assert_eq!(state.pending_new_diffs_count(), 0, "the removed order must not keep waiting for its status");
+
+        // 3. The status finally arrives -> nothing to pair with, the order stays out
+        let status = make_order_status("BTC", 7, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        assert_eq!(state.order_count(), 0, "a removed order must not rest when its status arrives late");
+
+        // 4. Its terminal status changes nothing either
+        let status = make_order_status("BTC", 7, "canceled");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn test_update_before_status_rests_with_the_updated_size() {
+        let mut state = empty_state();
+
+        let new = make_order_diff("BTC", 8, OrderDiff::New { sz: "1.5".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        let update = make_order_diff("BTC", 8, OrderDiff::Update { orig_sz: "1.5".to_string(), new_sz: "0.7".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![update])).unwrap();
+        assert_eq!(state.pending_new_diffs_count(), 1, "the update keeps the order waiting, with the new size");
+
+        let status = make_order_status("BTC", 8, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        assert_eq!(state.order_count(), 1);
+        assert_eq!(bid_size(&state, "BTC").value(), crate::order_book::Sz::parse_from_str("0.7").unwrap().value());
+    }
+
+    #[test]
+    fn test_update_to_zero_before_status_drops_the_order() {
+        let mut state = empty_state();
+
+        let new = make_order_diff("BTC", 9, OrderDiff::New { sz: "1.5".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        let update = make_order_diff("BTC", 9, OrderDiff::Update { orig_sz: "1.5".to_string(), new_sz: "0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![update])).unwrap();
+        assert_eq!(state.pending_new_diffs_count(), 0, "a size of zero is a removal");
+
+        let status = make_order_status("BTC", 9, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn test_diff_for_unknown_order_is_not_applied() {
+        let mut state = empty_state();
+
+        // Neither in the book nor waiting: nothing to do, nothing to break
+        let remove = make_order_diff("BTC", 10, OrderDiff::Remove);
+        state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
+        let update = make_order_diff("BTC", 10, OrderDiff::Update { orig_sz: "1.0".to_string(), new_sz: "2.0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![update])).unwrap();
+        assert_eq!(state.order_count(), 0);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+
+        // A status arriving afterwards waits for a New that is not coming
+        let status = make_order_status("BTC", 10, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        assert_eq!(state.order_count(), 0);
+        assert_eq!(state.pending_order_statuses_count(), 1);
     }
 
     // ==================== Status Filtering ====================

@@ -208,6 +208,24 @@ lazy_static! {
         &["status"]
     ).expect("metric can be created");
 
+    /// Update/Remove diffs that found no resting order. `outcome` says what
+    /// became of them: `pending_dropped` / `pending_updated` -- the order's New
+    /// was still waiting for its status (the diffs ran ahead) and was fixed up,
+    /// which before this counter existed left a phantom order in the book;
+    /// `unknown` -- neither resting nor waiting, a loss of some other kind.
+    pub static ref DIFF_WITHOUT_ORDER_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("orderbook_diff_without_order_total", "Update/Remove diffs for orders not in the book, by what was done with them"),
+        &["kind", "outcome"]
+    ).expect("metric can be created");
+
+    /// Signed block skew between the two book streams: statuses height minus
+    /// diffs height. Negative means the diffs run ahead, which is the direction
+    /// that produces the `pending_*` outcomes above.
+    pub static ref STREAM_SKEW_BLOCKS: IntGauge = IntGauge::new(
+        "orderbook_stream_skew_blocks",
+        "Block height of the order-status stream minus that of the book-diff stream"
+    ).expect("metric can be created");
+
     /// BBO changes per coin (top 5 tracked individually)
     pub static ref BBO_CHANGES_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new("bbo_changes_total", "BBO changes by coin"),
@@ -322,6 +340,8 @@ pub fn register_metrics() {
     REGISTRY.register(Box::new(ORDERBOOK_COINS_COUNT.clone())).ok();
     REGISTRY.register(Box::new(ORDERBOOK_UNTRIGGERED_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(UNTRIGGERED_EVICTIONS_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(DIFF_WITHOUT_ORDER_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(STREAM_SKEW_BLOCKS.clone())).ok();
     REGISTRY.register(Box::new(BBO_CHANGES_TOTAL.clone())).ok();
 
     // Resync & lock metrics

@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Message sent from file watcher threads to the main processor
@@ -71,6 +71,13 @@ const MAX_PARTIAL_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// straight back for the remainder.
 const READ_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// How long after switching to a new hour file the old one is checked for
+/// growth. The switch drains the old file until a read sees nothing new, but a
+/// write landing after that read is never picked up -- the reader has moved on.
+/// Long enough for any straggling append to land; a check that came sooner
+/// could pass and the loss go unnoticed.
+const ROTATION_GRACE: Duration = Duration::from_secs(3);
+
 /// Wall-clock milliseconds since the unix epoch, for the watcher health
 /// timestamps. (The previous `Instant::now().elapsed()` measured elapsed time
 /// since *now* - always ~0 - making the health values meaningless.)
@@ -96,6 +103,10 @@ struct FileReader {
     // Set when buffered data had to be discarded (oversized partial line);
     // drained by take_desynced so the watcher can notify the listener.
     desynced: bool,
+    // The file just switched away from, how far it was read, and when. Checked
+    // once after ROTATION_GRACE: growth past the read mark means lines were
+    // appended after the drain and never read.
+    rotated_from: Option<(PathBuf, u64, Instant)>,
 }
 
 impl FileReader {
@@ -107,6 +118,7 @@ impl FileReader {
             partial_line: Vec::new(),
             base_dir,
             desynced: false,
+            rotated_from: None,
         }
     }
 
@@ -473,6 +485,15 @@ impl FileReader {
             old_lines.extend(more);
         }
 
+        // Remember where the old file was left, to look back at it once the
+        // node has had time to finish with it. A partial tail left here is
+        // lost too, and shows up the same way: its newline lands past the mark.
+        if let Some(old) = self.current_path.take() {
+            if old != *path {
+                self.rotated_from = Some((old, self.file_position, Instant::now()));
+            }
+        }
+
         // Start tracking new file from beginning
         self.current_path = Some(path.clone());
         self.file = None;
@@ -480,6 +501,30 @@ impl FileReader {
         self.partial_line.clear();
 
         old_lines
+    }
+
+    /// Once, ROTATION_GRACE after a switch: did the old file grow past what was
+    /// read from it? Those lines were written after the drain and cannot be
+    /// applied now -- they are older than what the new file has already
+    /// delivered, and out-of-order application corrupts the book. Flag the
+    /// loss so the book re-syncs from a snapshot instead of carrying the gap.
+    fn check_rotation(&mut self) {
+        if !self.rotated_from.as_ref().is_some_and(|(_, _, at)| at.elapsed() >= ROTATION_GRACE) {
+            return;
+        }
+        let Some((path, read_to, _)) = self.rotated_from.take() else { return };
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() > read_to => {
+                error!(
+                    "{} grew by {} bytes after the switch away from it; those lines were never read, flagging desync",
+                    path.display(),
+                    meta.len() - read_to
+                );
+                self.desynced = true;
+            }
+            Ok(_) => {}
+            Err(err) => log::warn!("could not stat {} after rotation: {err}", path.display()),
+        }
     }
 
     /// Track an existing file (first event we see for it)
@@ -647,6 +692,10 @@ pub(super) fn spawn_file_watcher(
                     return;
                 }
             }
+
+            // A file switched away from is looked at once more after a grace
+            // period; growth there is data loss like any other discard.
+            reader.check_rotation();
 
             // If the reader had to discard buffered data, tell the listener so it
             // can re-sync the book from a fresh snapshot.
@@ -818,6 +867,53 @@ mod tests {
         assert_eq!(old_lines, vec!["{\"tail\":1}".to_string()], "old file's tail is drained before switching");
         // After the switch the new file is read from position 0.
         assert_eq!(reader.on_modify(), vec!["{\"first\":2}".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_growth_of_the_rotated_file_after_the_grace_is_flagged() {
+        let dir = test_dir("rotate_late_write");
+        let old = dir.join("0");
+        let new = dir.join("1");
+        append(&old, "");
+        let mut reader = FileReader::new(dir.clone());
+        reader.start_tracking(&old);
+        append(&old, "{\"tail\":1}\n");
+        append(&new, "{\"first\":2}\n");
+        reader.on_create(&new);
+
+        // Before the grace nothing is checked, even if the old file has grown.
+        append(&old, "{\"late\":3}\n");
+        reader.check_rotation();
+        assert!(!reader.take_desynced(), "checked too early would miss later appends");
+
+        // Past the grace: the old file grew past the read mark -> loss.
+        if let Some(entry) = reader.rotated_from.as_mut() {
+            entry.2 = Instant::now() - ROTATION_GRACE;
+        }
+        reader.check_rotation();
+        assert!(reader.take_desynced(), "a line appended after the switch is data loss");
+        assert!(reader.rotated_from.is_none(), "checked once");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_a_quiet_rotated_file_is_not_flagged() {
+        let dir = test_dir("rotate_quiet");
+        let old = dir.join("0");
+        let new = dir.join("1");
+        append(&old, "");
+        let mut reader = FileReader::new(dir.clone());
+        reader.start_tracking(&old);
+        append(&old, "{\"tail\":1}\n");
+        append(&new, "{\"first\":2}\n");
+        reader.on_create(&new);
+        if let Some(entry) = reader.rotated_from.as_mut() {
+            entry.2 = Instant::now() - ROTATION_GRACE;
+        }
+        reader.check_rotation();
+        assert!(!reader.take_desynced());
+        assert!(reader.rotated_from.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

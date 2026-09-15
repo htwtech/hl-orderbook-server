@@ -6,7 +6,7 @@ use crate::{
         LAST_EVENT_APPLIED_MS, LISTENER_LOCK_WAIT, ORDERBOOK_COINS_COUNT, ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT,
         ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_READY, ORDERBOOK_RESYNC_IN_FLIGHT, ORDERBOOK_TIME_MS,
         ORDERBOOK_UNTRIGGERED_TOTAL, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE,
-        RESYNC_PHASE_DURATION, TRADES_UNPAIRED_FILLS_TOTAL,
+        RESYNC_PHASE_DURATION, STREAM_SKEW_BLOCKS, TRADES_UNPAIRED_FILLS_TOTAL,
     },
     order_book::{
         Coin, Px, PxBand, Side, Snapshot, Sz,
@@ -361,6 +361,11 @@ pub(crate) struct OrderBookListener {
     // Highest block height observed on the live stream; the best "now" proxy
     // for bounding losses whose exact height is unknown (watcher discards).
     last_seen_height: u64,
+    // Latest block height seen from each book stream (statuses, diffs). Their
+    // difference is the skew between the two independently read files -- the
+    // window in which an order can be born and gone on the diff stream before
+    // its status is read. Kept so the skew is a number, not a guess.
+    stream_height: [u64; 2],
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
     // Pairs fill legs into public-schema trades; holds at most the one leg
     // awaiting its counterpart across Fills batches (single-event batches in
@@ -418,6 +423,7 @@ impl OrderBookListener {
             track_untriggered: true,
             max_loss_height: 0,
             last_seen_height: 0,
+            stream_height: [0, 0],
             internal_message_tx,
             trade_pairer: TradePairer::default(),
             last_l2_broadcast: None,
@@ -1082,6 +1088,18 @@ impl OrderBookListener {
         // Track the highest live-stream height: it bounds the height of any
         // data loss whose exact position is unknown (see mark_desynced).
         self.last_seen_height = self.last_seen_height.max(height);
+        let slot = match event_source {
+            EventSource::OrderStatuses => Some(0),
+            EventSource::OrderDiffs => Some(1),
+            EventSource::Fills => None,
+        };
+        if let Some(slot) = slot {
+            self.stream_height[slot] = self.stream_height[slot].max(height);
+            if self.stream_height.iter().all(|&h| h > 0) {
+                // i64: heights fit comfortably, and the gauge is signed on purpose.
+                STREAM_SKEW_BLOCKS.set(self.stream_height[0] as i64 - self.stream_height[1] as i64);
+            }
+        }
 
         // Sanity cap on batch size. A malformed/malicious line could otherwise
         // pin hundreds of MB and freeze the listener for seconds.
@@ -1242,11 +1260,12 @@ impl OrderBookListener {
                 }
 
                 info!(
-                    "State progress #{}: height={}, pending_statuses={}, pending_diffs={}",
+                    "State progress #{}: height={}, pending_statuses={}, pending_diffs={}, stream_skew_blocks={}",
                     sc,
                     state.height(),
                     state.pending_order_statuses_count(),
-                    state.pending_new_diffs_count()
+                    state.pending_new_diffs_count(),
+                    self.stream_height[0] as i64 - self.stream_height[1] as i64
                 );
             }
         }

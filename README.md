@@ -394,6 +394,8 @@ The in-memory book is kept consistent with the node through three layers:
 2. **Snapshot replay** - every book-affecting event that arrives while a snapshot is being generated is cached and replayed above the snapshot height, making the snapshot-to-stream handoff gapless.
 3. **Desync self-healing** - any provable event loss (parse/apply error on a batch, oversized batch, watcher buffer discard, pending-cache eviction) marks the book out-of-sync and triggers an automatic background snapshot re-fetch. The book keeps serving its current state until the fresh snapshot lands. Each loss is recorded with a block-height bound, and the out-of-sync flag only clears once a snapshot's height actually covers that bound - a snapshot generated from lagging node state cannot mask a newer loss. Each occurrence is counted in `orderbook_desyncs_total{reason}`. The status/diff pairing caches are evicted by age (60 s): expected orphans are dropped silently, while an unpaired diff aging out counts as data loss and re-syncs the book.
 4. **Watcher watchdog** - if a file watcher thread dies (or every watcher channel closes), the server exits so the process supervisor restarts it into a clean re-sync, instead of serving a silently frozen book that still reports `ready`. A watcher that is alive but has produced no events for 2 minutes is loud-logged (restarting would not fix a stalled node).
+5. **Order-independent pairing** - the status and diff streams are read by independent threads, and the diff stream routinely runs ahead (the status file is several times larger). An order placed and removed on the diff stream before its `open` status is read used to rest in the book anyway once the status arrived - a phantom order that nothing counted as a loss, so it stayed until the next re-sync. An `Update` or `Remove` that finds no resting order is now applied to the order's New diff still waiting for its status (size corrected, or the pending entry dropped), so the book converges to the same state whichever stream is ahead. Counted in `orderbook_diff_without_order_total{kind,outcome}`; the skew itself is exported as `orderbook_stream_skew_blocks`.
+6. **Rotation check** - after switching to a new hour file, the old one is checked once, 3 s later: if it grew past what was read from it, the node appended after the drain and those lines are gone. That is flagged as data loss and re-synced like any other, rather than carried silently.
 
 ### Deduplication
 
@@ -447,6 +449,7 @@ curl http://localhost:9090/metrics
 | | `orderbook_coins_count` | Number of coins tracked |
 | | `pending_orders_cache_size` | Pending order statuses in HFT cache |
 | | `pending_diffs_cache_size` | Pending book diffs in HFT cache |
+| | `orderbook_stream_skew_blocks` | Block height of the status stream minus the diff stream's (negative: diffs ahead) |
 | | `uptime_seconds` | Server uptime in seconds |
 | | `server_start_time_seconds` | Server start timestamp (unix) |
 | **Latency** | `bbo_broadcast_latency_seconds` | BBO broadcast latency histogram |
@@ -460,6 +463,7 @@ curl http://localhost:9090/metrics
 | | `channel_drops_total` | Messages dropped due to lag |
 | | `broadcast_channel_lag` | Broadcast channel lag (receivers behind) |
 | | `orderbook_desyncs_total{reason}` | Times the book was marked out-of-sync (each triggers an automatic background snapshot re-fetch). Alert on a sustained rate; occasional self-heals are benign |
+| | `orderbook_diff_without_order_total{kind,outcome}` | Update/Remove diffs with no resting order: `pending_dropped` / `pending_updated` were applied to the order's waiting New (would have been phantoms before); `unknown` found nothing at all |
 
 ### Disable Metrics
 
