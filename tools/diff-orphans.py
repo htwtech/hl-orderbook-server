@@ -178,9 +178,11 @@ def statuses_for(path, oids):
 
 
 def diffs_for(path, oids):
-    """Diff events for these oids: oid -> [(block, kind, newSz)]."""
+    """Diff events for these oids: oid -> [(block, kind, newSz)], and what the
+    diffs themselves say about the order: oid -> {coin, px, user}."""
     wanted = set(oids)
     found = collections.defaultdict(list)
+    about = {}
     for batch in grep_batches(path, oids):
         block = batch.get("block_number")
         for ev in batch.get("events") or []:
@@ -188,7 +190,8 @@ def diffs_for(path, oids):
             if oid in wanted:
                 kind, new_sz = diff_kind(ev)
                 found[oid].append((block, kind, new_sz))
-    return found
+                about.setdefault(oid, {k: ev.get(k) for k in ("coin", "px", "user")})
+    return found, about
 
 
 def read_oids(path):
@@ -240,11 +243,14 @@ def trace_oids(args, diffs_files, statuses_files):
         return 2
     hours = sorted(set(diffs_files) & set(statuses_files), key=hour_key)[-args.hours:]
     print("tracing {} oids over {} hour(s): {}".format(len(oids), len(hours), ", ".join(hours)))
-    all_diffs, all_statuses = collections.defaultdict(list), collections.defaultdict(list)
+    all_diffs, all_statuses, about = collections.defaultdict(list), collections.defaultdict(list), {}
     for hour in hours:
         print("  grep {} ...".format(hour), file=sys.stderr)
-        for oid, evs in diffs_for(diffs_files[hour], oids).items():
+        found, seen = diffs_for(diffs_files[hour], oids)
+        for oid, evs in found.items():
             all_diffs[oid].extend(evs)
+        for oid, info in seen.items():
+            about.setdefault(oid, info)
         for oid, evs in statuses_for(statuses_files[hour], oids).items():
             all_statuses[oid].extend(evs)
 
@@ -256,9 +262,14 @@ def trace_oids(args, diffs_files, statuses_files):
         key = re.sub(r" ?@\d+| ?\(\d+ blocks apart\)| ?\(statuses: [^)]*\)| ?\(\d+ News, \d+ Removes\)", "", v)
         verdicts[re.sub(r"\s+", " ", key).replace(" :", ":").strip()] += 1
         order = st[0][2] if st else {}
-        print("\noid {}  coin {} {} px {} tif {} trigger {}".format(
-            oid, order.get("coin", "?"), order.get("side", "?"), order.get("limitPx", "?"),
-            order.get("tif", "?"), order.get("isTrigger", "?")))
+        # A status names the order fully; failing that, the diff still says
+        # whose it is, on what coin, at what price -- and the user is the
+        # first thing to look at when a whole cluster has no status at all.
+        info = about.get(oid, {})
+        print("\noid {}  coin {} {} px {} tif {} trigger {}  user {}".format(
+            oid, order.get("coin", info.get("coin", "?")), order.get("side", "?"),
+            order.get("limitPx", info.get("px", "?")), order.get("tif", "?"), order.get("isTrigger", "?"),
+            info.get("user", "?")))
         print("  diffs:    " + (" -> ".join("{}@{}{}".format(k, b, "(sz " + sz + ")" if sz is not None else "") for b, k, sz in d) or "none"))
         print("  statuses: " + (" -> ".join("{}@{}".format(s, b) for b, s, _ in st) or "none"))
         print("  " + v)
