@@ -30,6 +30,14 @@ comes out "only in ours" and "only in ref" at once -- which is exactly what the
 first run against the public API produced. The raw strings are still shown,
 once, so a spelling difference is seen rather than silently absorbed.
 
+Disagreements are also sorted into two kinds. A level where the two sides
+differ by the SAME amount in three consecutive matches is a "floor": an order
+one side holds and the other does not, standing still while the market moves
+around it -- a phantom if it is on our side, a hole if it is only on the
+reference's. Everything else is churn: the two sides caught at different
+moments inside a block, gone by the next match. The summary counts both and
+lists the longest-standing floors with their sign.
+
 With -v every price the sides disagree on gets a line of its own under the
 frame's verdict -- the block time, the side, the price, and each source's
 sz/n there ("-" where that source has no such price) -- so a disagreement can
@@ -59,6 +67,7 @@ from urllib.parse import urlparse
 
 DEFAULT_LEVELS = 20
 RING = 300          # block times kept per source; ~20 s at 15/s
+FLOOR_FRAMES = 3    # matches in a row with the same delta before a level counts as a floor
 
 
 class Ws:
@@ -285,6 +294,11 @@ class Pair:
         self.counts, self.ranks = [], []
         self.top_ok, self.top_seen = collections.Counter(), collections.Counter()   # per depth: only matches deep enough count
         self.kinds = collections.Counter()
+        # (side, px) -> (delta, matches in a row with that delta); floors are
+        # the runs that reach FLOOR_FRAMES, remembered with their longest run.
+        self.run = {}
+        self.floors = {}
+        self.floor_levels = self.churn_levels = 0
 
     @property
     def name(self):
@@ -309,7 +323,38 @@ class Pair:
             if k <= min(n):
                 self.top_ok[k] += top_n(ta, k) == top_n(tb, k)
                 self.top_seen[k] += 1
-        return "{} {:>3}/{}  {}>{:>3} {}>{:>3}".format(self.name, differing, total, self.a, am, self.b, bm)
+        floors_now = self.track_floors(ta, tb)
+        return "{} {:>3}/{}  {}>{:>3} {}>{:>3}{}".format(
+            self.name, differing, total, self.a, am, self.b, bm, " f{}".format(floors_now) if floors_now else "")
+
+    def track_floors(self, ta, tb):
+        """Advance the per-level runs with this match; returns how many of its
+        differing levels are floors (same delta FLOOR_FRAMES matches running)."""
+        present = set()
+        floors_now = 0
+        for side, (sa, sb) in enumerate(zip(ta, tb)):
+            for px in set(sa) | set(sb):
+                va, vb = sa.get(px), sb.get(px)
+                if va == vb:
+                    continue
+                delta = ((va[0] if va else Decimal(0)) - (vb[0] if vb else Decimal(0)),
+                         (va[1] if va else 0) - (vb[1] if vb else 0))
+                key = (side, px)
+                present.add(key)
+                prev = self.run.get(key)
+                streak = prev[1] + 1 if prev and prev[0] == delta else 1
+                self.run[key] = (delta, streak)
+                if streak >= FLOOR_FRAMES:
+                    floors_now += 1
+                    longest = self.floors.get(key, (None, 0))[1]
+                    self.floors[key] = (delta, max(longest, streak))
+                else:
+                    self.churn_levels += 1
+        for key in list(self.run):
+            if key not in present:
+                del self.run[key]
+        self.floor_levels += floors_now
+        return floors_now
 
     def summary(self):
         print("\n--- {} ---".format(self.name))
@@ -335,6 +380,18 @@ class Pair:
         total_k = sum(self.kinds.values())
         for kind, c in self.kinds.most_common():
             print("  {:>32}: {:>6}  ({:.1f}%)".format(kind, c, pct(c, total_k)))
+        # Floors against churn: what part of the disagreement stands still.
+        total_lv = self.floor_levels + self.churn_levels
+        pos = [k for k, (d, _) in self.floors.items() if d[0] > 0 or (d[0] == 0 and d[1] > 0)]
+        neg = [k for k in self.floors if k not in pos]
+        print("floors (same delta {} matches running): {} of {} differing level-matches ({:.1f}%); "
+              "{} distinct levels: {} where {} has extra, {} where {} has extra".format(
+                  FLOOR_FRAMES, self.floor_levels, total_lv, pct(self.floor_levels, total_lv),
+                  len(self.floors), len(pos), self.a, len(neg), self.b))
+        longest = sorted(self.floors.items(), key=lambda kv: -kv[1][1])[:10]
+        for (side, px), (delta, streak) in longest:
+            print("  {} {:>10}  {}{}/{:+d}  {} matches".format(
+                "bid" if side == 0 else "ask", num(px), "+" if delta[0] >= 0 else "", num(delta[0]), delta[1], streak))
 
 
 class Stream(threading.Thread):
