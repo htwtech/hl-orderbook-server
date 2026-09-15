@@ -1652,60 +1652,75 @@ impl Drop for ActiveSubGuard {
 /// 1. 3 dedicated threads for file watching (parallel I/O)
 /// 2. Processes OrderDiffs immediately (doesn't wait for OrderStatuses)
 /// 3. Uses process time instead of block time for lowest latency
-/// When one book stream has nothing queued, how far past its last delivered
-/// height the other may be applied. A few blocks of halves waiting for their
-/// other half is nothing; thousands is what overran the pending caches.
+/// When one book stream has nothing to offer, how far past its last taken
+/// height the other may still be applied. A few blocks of halves waiting for
+/// their other half is nothing; thousands is what overran the pending caches.
 const MERGE_LOOKAHEAD_BLOCKS: u64 = 32;
-/// A stream that has delivered nothing while the other advanced this many
-/// blocks is dead -- the watchdog's case -- and the book follows the live one
-/// rather than freezing. Blocks, not seconds: the listener itself pauses under
-/// load, and a clock would call every pause a death.
-const MERGE_STALL_BLOCKS: u64 = 600;
-/// Queued batches are small (a line is one or two events), but a reader far
-/// behind the other after a long stall is not; past this many, apply anyway.
-const MERGE_MAX_QUEUED: usize = 500_000;
+/// With one stream waiting on the other and nothing arriving from it for this
+/// long, the other is dead -- the watchdog's case -- and the book follows the
+/// live stream rather than freezing. Measured only while actually waiting, so
+/// a slow reader (still delivering) never looks dead, and neither does a
+/// listener pause (nothing waits during it).
+const MERGE_DEAD_WAIT: Duration = Duration::from_secs(10);
+/// Batches taken per lock acquisition.
+const MERGE_TAKE: usize = 64;
 
-/// Applies the two book streams in block order, whichever thread read them.
+/// The two live book streams, merged by block height at their channels.
 ///
 /// The status and diff files are read by independent threads and used to be
 /// applied as they arrived. In steady state that is within a block or two of
-/// block order. After a stall -- a snapshot install, a slow flush -- both
-/// readers catch up in fixed-size chunks, and a chunk of diffs covers several
-/// times the blocks a chunk of statuses does, so one stream ran thousands of
-/// blocks ahead: every New in that stretch waited for a status still on disk
-/// (or every status for a New), the pending caches overran their caps, and
-/// what overran was lost. Measured on mainnet: ten thousand New diffs thrown
-/// away per second for several seconds after each install, each one a hole.
+/// block order. After a stall both readers catch up in fixed-size chunks, and
+/// a chunk of diffs covers several times the blocks a chunk of statuses does,
+/// so one stream ran thousands of blocks ahead: every New in that stretch
+/// waited for a status still on disk (or every status for a New), the pending
+/// caches overran their caps, and what overran was lost. Ten thousand New
+/// diffs thrown away per second after each install, each one a hole.
 ///
-/// So the streams are merged: each is queued, and the batch with the lower
-/// block height is applied first, a status before a diff of the same block.
-/// While both queues have something this is exactly the node's own order and
-/// nothing waits. Only a lone queue -- the other stream has delivered nothing
-/// newer yet -- is held, and only past MERGE_LOOKAHEAD_BLOCKS beyond the
-/// other's last delivered height.
+/// Each stream now has a bounded channel of its own, and the listener takes
+/// from whichever has the lower block at its head -- a status before a diff
+/// of the same block. That is the node's own order, whichever thread read
+/// what. A reader that runs ahead fills its channel and blocks on the send:
+/// back-pressure in the one place it is meaningful, with a fixed memory
+/// bound. Only a lone stream -- the other's channel is empty -- is held, and
+/// only past MERGE_LOOKAHEAD_BLOCKS beyond the other's last taken height.
 ///
-/// (An earlier version held whichever stream was ahead of the other's applied
-/// frontier. With both held nothing could advance, and the escape hatches --
-/// "the other has stopped", "too many held" -- released blindly and in bulk:
-/// 200 000 batches queued, a 2 400-block skew, both pending caches over their
-/// caps. Merging by height has no such state: the lower head always applies.)
-struct StreamMerge {
-    /// Queued batches per stream [statuses, diffs], in arrival order.
-    queues: [VecDeque<(u64, EventBatch)>; 2],
-    /// Highest height delivered by each stream, applied or still queued.
+/// (Two earlier versions held the stream that was ahead in the listener,
+/// behind a shared channel. With nothing to slow the reader down the queue
+/// grew without bound, and the rules for letting it go -- a stall, a cap --
+/// fired during ordinary catch-up and released in bulk: 200 000 batches
+/// queued, the skew at 2 400 blocks, both pending caches over their caps.)
+struct LiveMerge {
+    rx: [tokio::sync::mpsc::Receiver<String>; 2],
+    /// The next parsed batch of each stream, if one has been read ahead.
+    peek: [Option<(u64, EventBatch)>; 2],
+    /// Highest height taken from each stream.
     seen: [u64; 2],
+    /// Declared dead: waited MERGE_DEAD_WAIT on it and nothing came. Cleared by
+    /// its next line.
+    dead: [bool; 2],
+    /// When the current wait on the other stream began. Kept here, not in the
+    /// future: `take` is cancelled by every flush tick, and a timer that
+    /// restarted with it would never run out.
+    waiting_since: Option<Instant>,
+    /// Batches taken but not yet handed out -- survives a cancelled `take`.
+    ready: Vec<(u64, EventBatch, EventSource)>,
 }
 
-impl StreamMerge {
-    fn new() -> Self {
-        Self { queues: [VecDeque::new(), VecDeque::new()], seen: [0, 0] }
-    }
+/// What a wait woke up on.
+enum Woke {
+    Line(usize, Option<String>),
+    Dead(usize),
+}
 
-    const fn slot(source: EventSource) -> Option<usize> {
-        match source {
-            EventSource::OrderStatuses => Some(0),
-            EventSource::OrderDiffs => Some(1),
-            EventSource::Fills => None,
+impl LiveMerge {
+    fn new(streams: parallel::LiveStreams) -> Self {
+        Self {
+            rx: [streams.statuses, streams.diffs],
+            peek: [None, None],
+            seen: [0, 0],
+            dead: [false, false],
+            waiting_since: None,
+            ready: Vec::with_capacity(MERGE_TAKE),
         }
     }
 
@@ -1713,50 +1728,120 @@ impl StreamMerge {
         if slot == 0 { EventSource::OrderStatuses } else { EventSource::OrderDiffs }
     }
 
-    /// Offer a live batch; returns everything that may be applied now, in order.
-    fn offer(&mut self, height: u64, batch: EventBatch, source: EventSource) -> Vec<(u64, EventBatch, EventSource)> {
-        let Some(me) = Self::slot(source) else { return vec![(height, batch, source)] };
-        self.seen[me] = self.seen[me].max(height);
-        self.queues[me].push_back((height, batch));
-        self.drain()
-    }
-
-    fn drain(&mut self) -> Vec<(u64, EventBatch, EventSource)> {
-        let mut out = Vec::new();
-        loop {
-            let heads = [self.queues[0].front().map(|(h, _)| *h), self.queues[1].front().map(|(h, _)| *h)];
-            let me = match heads {
-                // Both have something: the lower block first, a status before
-                // a diff of the same block.
-                [Some(hs), Some(hd)] => {
-                    if hs <= hd { 0 } else { 1 }
-                }
-                // One stream alone: everything the other delivered is applied,
-                // so its last delivered height is where it stands. Apply a
-                // little past that, wait beyond -- unless it is dead, or the
-                // backlog is too big to keep.
-                [Some(h), None] | [None, Some(h)] => {
-                    let me = if heads[0].is_some() { 0 } else { 1 };
-                    let other = 1 - me;
-                    let other_spoke = self.seen[other] > 0;
-                    let within = !other_spoke || h <= self.seen[other] + MERGE_LOOKAHEAD_BLOCKS;
-                    let dead = other_spoke && self.seen[me] > self.seen[other] + MERGE_STALL_BLOCKS;
-                    let too_many = self.queues[me].len() > MERGE_MAX_QUEUED;
-                    if !(within || dead || too_many) {
-                        break;
-                    }
-                    me
-                }
-                [None, None] => break,
-            };
-            let Some((h, b)) = self.queues[me].pop_front() else { break };
-            out.push((h, b, Self::source(me)));
+    fn accept(&mut self, i: usize, line: &str) {
+        self.dead[i] = false;
+        self.waiting_since = None;
+        if let Some(parsed) = parse_event_line(line, Self::source(i)) {
+            self.peek[i] = Some(parsed);
         }
-        out
     }
 
-    fn queued(&self) -> usize {
-        self.queues[0].len() + self.queues[1].len()
+    /// Read ahead one batch of stream `i` if none is peeked, without waiting.
+    /// Returns false when the channel is closed.
+    fn refill(&mut self, i: usize) -> bool {
+        while self.peek[i].is_none() {
+            match self.rx[i].try_recv() {
+                Ok(line) => self.accept(i, &line),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return true,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return false,
+            }
+        }
+        true
+    }
+
+    /// Which stream may be applied next, if any: the lower head when both
+    /// have one; a lone head only within the lookahead of the other's last
+    /// taken height, or when the other is dead.
+    fn pick(&self) -> Option<usize> {
+        match [self.peek[0].as_ref().map(|(h, _)| *h), self.peek[1].as_ref().map(|(h, _)| *h)] {
+            [Some(hs), Some(hd)] => Some(if hs <= hd { 0 } else { 1 }),
+            [Some(h), None] | [None, Some(h)] => {
+                let me = if self.peek[0].is_some() { 0 } else { 1 };
+                let other = 1 - me;
+                let ok = self.seen[other] == 0 || h <= self.seen[other] + MERGE_LOOKAHEAD_BLOCKS || self.dead[other];
+                ok.then_some(me)
+            }
+            [None, None] => None,
+        }
+    }
+
+    /// Up to MERGE_TAKE batches in block order, waiting as long as none can be
+    /// applied. Cancel-safe: whatever was taken before a cancellation is
+    /// handed out by the next call. `Err` means a book channel closed.
+    async fn take(&mut self) -> Result<Vec<(u64, EventBatch, EventSource)>, ()> {
+        loop {
+            if self.ready.len() >= MERGE_TAKE {
+                return Ok(std::mem::take(&mut self.ready));
+            }
+            if !self.refill(0) || !self.refill(1) {
+                return Err(());
+            }
+            match self.pick() {
+                Some(i) => {
+                    let Some((h, b)) = self.peek[i].take() else { continue };
+                    self.seen[i] = self.seen[i].max(h);
+                    self.ready.push((h, b, Self::source(i)));
+                }
+                None => {
+                    if !self.ready.is_empty() {
+                        return Ok(std::mem::take(&mut self.ready));
+                    }
+                    self.wait().await?;
+                }
+            }
+        }
+    }
+
+    /// Nothing can be applied: wait for a line that can change that. With one
+    /// head waiting on the other stream, that is the other's channel, with a
+    /// deadline past which the other is dead; with both empty, either channel.
+    async fn wait(&mut self) -> Result<(), ()> {
+        let waiting_on = match (&self.peek[0], &self.peek[1]) {
+            (Some(_), None) => Some(1),
+            (None, Some(_)) => Some(0),
+            _ => None,
+        };
+        // The select borrows the channels; what it woke on is carried out as
+        // a plain value so the bookkeeping below can take `self` again.
+        let woke = match waiting_on {
+            Some(other) => {
+                let since = *self.waiting_since.get_or_insert_with(Instant::now);
+                let remaining = MERGE_DEAD_WAIT.saturating_sub(since.elapsed());
+                let rx = &mut self.rx[other];
+                tokio::select! {
+                    got = rx.recv() => Woke::Line(other, got),
+                    () = tokio::time::sleep(remaining) => Woke::Dead(other),
+                }
+            }
+            None => {
+                let [rx0, rx1] = &mut self.rx;
+                tokio::select! {
+                    got = rx0.recv() => Woke::Line(0, got),
+                    got = rx1.recv() => Woke::Line(1, got),
+                }
+            }
+        };
+        match woke {
+            Woke::Line(i, Some(line)) => self.accept(i, &line),
+            Woke::Line(_, None) => return Err(()),
+            Woke::Dead(other) => {
+                if !self.dead[other] {
+                    log::warn!(
+                        "{} delivered nothing for {:?} while the other stream waited on it; following the live stream alone",
+                        Self::source(other),
+                        MERGE_DEAD_WAIT
+                    );
+                }
+                self.dead[other] = true;
+                self.waiting_since = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lines waiting in the two channels: the readers' lead over the listener.
+    fn backlog(&self) -> usize {
+        self.rx[0].len() + self.rx[1].len()
     }
 }
 
@@ -1805,7 +1890,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     // events sit on disk meanwhile). The join handles and health timestamps
     // feed the watchdog in the periodic ticker below - a dead or wedged
     // watcher must not let the server keep serving a silently frozen book.
-    let (mut tokio_rx, watcher_handles, last_order_statuses, _last_fills, last_order_diffs) =
+    let (mut tokio_rx, live_streams, watcher_handles, last_order_statuses, _last_fills, last_order_diffs) =
         parallel::start_parallel_file_watchers(dir, backfill_min_height);
 
     // Snapshot fetch channel
@@ -1840,7 +1925,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         Desync,
     }
 
-    let mut merge = StreamMerge::new();
+    let mut merge = LiveMerge::new(live_streams);
 
     // The initial snapshot waits for both book backfills: installing it takes
     // the replay cache away, and every backfill line still in flight would be
@@ -1881,10 +1966,8 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 let mut actions = Vec::with_capacity(count);
                 for event in event_buf.drain(..) {
                     let (line, source, is_backfill) = match event {
-                        // OrderDiffs are the BBO-critical path; statuses and fills
-                        // are less latency-sensitive but share the same flow.
-                        parallel::FileEvent::OrderDiff(line) => (line, EventSource::OrderDiffs, false),
-                        parallel::FileEvent::OrderStatus(line) => (line, EventSource::OrderStatuses, false),
+                        // Live book lines come through the merge arm below, not
+                        // this channel; fills do, and never touch the book.
                         parallel::FileEvent::Fill(line) => (line, EventSource::Fills, false),
                         parallel::FileEvent::BackfillOrderDiff(line) => (line, EventSource::OrderDiffs, true),
                         parallel::FileEvent::BackfillOrderStatus(line) => (line, EventSource::OrderStatuses, true),
@@ -1896,8 +1979,10 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             continue;
                         }
                         parallel::FileEvent::BackfillDone(source) => {
-                            if let Some(slot) = StreamMerge::slot(source) {
-                                backfills_done[slot] = true;
+                            match source {
+                                EventSource::OrderStatuses => backfills_done[0] = true,
+                                EventSource::OrderDiffs => backfills_done[1] = true,
+                                EventSource::Fills => {}
                             }
                             if backfills_done.iter().all(|&d| d) {
                                 info!("Both book backfills complete; the initial snapshot may be installed");
@@ -1906,20 +1991,15 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         }
                     };
                     if let Some((height, batch)) = parse_event_line(&line, source) {
-                        if is_backfill {
+                        actions.push(if is_backfill {
                             // Backfill lines are cache-only: replayed above the
                             // snapshot height, never applied to a live book.
-                            actions.push(Action::Backfill(batch));
+                            Action::Backfill(batch)
                         } else {
-                            // Live batches go through the merge, which applies
-                            // them in block order across the two streams.
-                            for (h, b, s) in merge.offer(height, batch, source) {
-                                actions.push(Action::Apply(h, b, s));
-                            }
-                        }
+                            Action::Apply(height, batch, source)
+                        });
                     }
                 }
-                SKEW_GATE_HELD.set(merge.queued() as i64);
                 if !actions.is_empty() {
                     let lock_start = Instant::now();
                     let mut guard = listener.lock().await;
@@ -1936,6 +2016,23 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     // the next flush tick.
                     guard.flush_l2_if_due();
                 }
+            }
+
+            // The live book streams, in block order across both, up to
+            // MERGE_TAKE per lock acquisition. Waits inside when nothing can be
+            // applied yet, so this arm is only ready with work in hand.
+            taken = merge.take() => {
+                let Ok(batches) = taken else {
+                    return Err("a live book channel closed (its watcher thread exited)".into());
+                };
+                SKEW_GATE_HELD.set(merge.backlog() as i64);
+                let lock_start = Instant::now();
+                let mut guard = listener.lock().await;
+                LISTENER_LOCK_WAIT.observe(lock_start.elapsed().as_secs_f64());
+                for (height, batch, source) in batches {
+                    guard.apply_event_batch(height, batch, source);
+                }
+                guard.flush_l2_if_due();
             }
 
             // Snapshot fetch result
@@ -3042,100 +3139,114 @@ mod tests {
         assert!(reg.snapshot().is_empty());
     }
 
-    // ==================== Stream merge ====================
+    // ==================== Live merge ====================
 
-    fn statuses_at(height: u64) -> EventBatch {
-        EventBatch::Orders(make_status_batch("BTC", height, height))
+    fn status_line(height: u64) -> String {
+        serde_json::to_string(&make_status_batch("BTC", height, height)).unwrap()
     }
 
-    fn diffs_at(height: u64) -> EventBatch {
-        EventBatch::BookDiffs(make_diff_batch("BTC", height, height, serde_json::json!("remove")))
+    fn diff_line(height: u64) -> String {
+        serde_json::to_string(&make_diff_batch("BTC", height, height, serde_json::json!("remove"))).unwrap()
     }
 
-    /// (height, stream) of what the merge let through.
-    fn passed(out: &[(u64, EventBatch, EventSource)]) -> Vec<(u64, &'static str)> {
+    fn live_merge() -> (LiveMerge, tokio::sync::mpsc::Sender<String>, tokio::sync::mpsc::Sender<String>) {
+        let (stx, srx) = tokio::sync::mpsc::channel(1000);
+        let (dtx, drx) = tokio::sync::mpsc::channel(1000);
+        (LiveMerge::new(parallel::LiveStreams { statuses: srx, diffs: drx }), stx, dtx)
+    }
+
+    /// (height, stream) of what the merge handed out.
+    fn taken(out: &[(u64, EventBatch, EventSource)]) -> Vec<(u64, &'static str)> {
         out.iter().map(|(h, _, s)| (*h, s.metric_label())).collect()
     }
 
-    #[test]
-    fn merge_passes_streams_that_stay_in_step() {
-        let mut m = StreamMerge::new();
-        for h in 100..110 {
-            assert_eq!(passed(&m.offer(h, statuses_at(h), EventSource::OrderStatuses)), vec![(h, "orders")]);
-            assert_eq!(passed(&m.offer(h, diffs_at(h), EventSource::OrderDiffs)), vec![(h, "diffs")]);
+    #[tokio::test]
+    async fn live_merge_takes_the_lower_block_first_a_status_before_a_diff() {
+        let (mut m, stx, dtx) = live_merge();
+        // Diffs arrive first and far ahead; statuses trail.
+        for h in 100..=110 {
+            dtx.send(diff_line(h)).await.unwrap();
         }
-        assert_eq!(m.queued(), 0);
+        for h in 100..=105 {
+            stx.send(status_line(h)).await.unwrap();
+        }
+        let out = taken(&m.take().await.unwrap());
+        let mut expect = Vec::new();
+        for h in 100..=105 {
+            expect.push((h, "orders"));
+            expect.push((h, "diffs"));
+        }
+        // Past the last status the diffs are alone, and within the lookahead.
+        expect.extend((106..=110).map(|h| (h, "diffs")));
+        assert_eq!(out, expect);
     }
 
-    #[test]
-    fn merge_applies_by_block_a_status_before_a_diff_of_the_same_block() {
-        let mut m = StreamMerge::new();
-        m.offer(100, statuses_at(100), EventSource::OrderStatuses);
-        // Diffs race 100 blocks ahead: a few pass on the lookahead, the rest queue.
-        let mut through = Vec::new();
+    #[tokio::test]
+    async fn live_merge_holds_a_lone_stream_past_the_lookahead_until_the_other_delivers() {
+        let (mut m, stx, dtx) = live_merge();
+        stx.send(status_line(100)).await.unwrap();
         for h in 100..=200 {
-            through.extend(passed(&m.offer(h, diffs_at(h), EventSource::OrderDiffs)));
+            dtx.send(diff_line(h)).await.unwrap();
         }
-        assert_eq!(through.last(), Some(&(132, "diffs")));
-        assert_eq!(m.queued(), 68, "133..=200 queued");
+        let out = taken(&m.take().await.unwrap());
+        assert_eq!(out.first(), Some(&(100, "orders")));
+        assert_eq!(out.last(), Some(&(132, "diffs")), "the lone diffs stop at 100 + 32");
+        assert_eq!(m.backlog(), 67, "134..=200 still in the channel (133 is read ahead); a reader would block past it");
 
-        // A status for 133 goes first, then the diffs of 133 -- and, the
-        // statuses being alone again, the diffs up to 133 + 32 on the lookahead.
-        let out = m.offer(133, statuses_at(133), EventSource::OrderStatuses);
-        assert_eq!(passed(&out), [(133, "orders")].into_iter().chain((133..=165).map(|h| (h, "diffs"))).collect::<Vec<_>>());
-        assert_eq!(m.queued(), 35, "166..=200 still queued");
-        // The status for 140 is the lower head: it goes before any queued diff,
-        // then the lookahead moves on to 172.
-        let out = m.offer(140, statuses_at(140), EventSource::OrderStatuses);
-        assert_eq!(passed(&out), [(140, "orders")].into_iter().chain((166..=172).map(|h| (h, "diffs"))).collect::<Vec<_>>());
-        assert_eq!(m.queued(), 28);
+        // The statuses deliver 140: the queued diffs up to 140 go first, then
+        // the status, then the lookahead moves on to 172.
+        stx.send(status_line(140)).await.unwrap();
+        let out = taken(&m.take().await.unwrap());
+        let mut expect: Vec<(u64, &str)> = (133..=139).map(|h| (h, "diffs")).collect();
+        expect.push((140, "orders"));
+        expect.extend((140..=172).map(|h| (h, "diffs")));
+        assert_eq!(out, expect);
     }
 
-    #[test]
-    fn merge_holds_a_lone_stream_only_past_the_lookahead() {
-        let mut m = StreamMerge::new();
-        m.offer(100, diffs_at(100), EventSource::OrderDiffs);
-        for h in 100..=140 {
-            m.offer(h, statuses_at(h), EventSource::OrderStatuses);
-        }
-        assert_eq!(m.queued(), 8, "statuses 133..=140 wait for the diffs to catch up");
-        // The diffs deliver 101: it is the lower head and goes first; that
-        // brings exactly one status, 133, within 101 + 32.
-        let out = m.offer(101, diffs_at(101), EventSource::OrderDiffs);
-        assert_eq!(passed(&out), vec![(101, "diffs"), (133, "orders")]);
-        assert_eq!(m.queued(), 7);
-        // 108 brings the rest within reach.
-        let out = m.offer(108, diffs_at(108), EventSource::OrderDiffs);
-        assert_eq!(passed(&out), [(108, "diffs")].into_iter().chain((134..=140).map(|h| (h, "orders"))).collect::<Vec<_>>());
-        assert_eq!(m.queued(), 0);
-    }
-
-    #[test]
-    fn merge_follows_a_stream_whose_partner_has_died() {
-        let mut m = StreamMerge::new();
-        m.offer(100, statuses_at(100), EventSource::OrderStatuses);
-        let mut through = Vec::new();
-        for h in 101..=(100 + MERGE_STALL_BLOCKS) {
-            through.extend(passed(&m.offer(h, diffs_at(h), EventSource::OrderDiffs)));
-        }
-        assert_eq!(through.last(), Some(&(132, "diffs")), "waited past the lookahead");
-        assert!(m.queued() > 0);
-        // One block past the stall bound the statuses are declared dead and
-        // the diffs go through, in order, and keep going.
-        let out = m.offer(101 + MERGE_STALL_BLOCKS, diffs_at(101 + MERGE_STALL_BLOCKS), EventSource::OrderDiffs);
-        assert_eq!(passed(&out).first(), Some(&(133, "diffs")));
-        assert_eq!(m.queued(), 0);
-        assert_eq!(passed(&m.offer(5000, diffs_at(5000), EventSource::OrderDiffs)), vec![(5000, "diffs")]);
-    }
-
-    #[test]
-    fn merge_does_not_engage_until_both_streams_have_spoken() {
-        let mut m = StreamMerge::new();
+    #[tokio::test]
+    async fn live_merge_hands_out_at_most_a_lockful_at_a_time() {
+        let (mut m, stx, dtx) = live_merge();
         for h in 1..=100 {
-            assert_eq!(passed(&m.offer(h, diffs_at(h), EventSource::OrderDiffs)), vec![(h, "diffs")]);
+            stx.send(status_line(h)).await.unwrap();
+            dtx.send(diff_line(h)).await.unwrap();
         }
-        // Fills are never queued.
-        let fills = EventBatch::Fills(make_fills_batch(&["BTC"], 500));
-        assert_eq!(passed(&m.offer(500, fills, EventSource::Fills)), vec![(500, "fills")]);
+        let out = m.take().await.unwrap();
+        assert_eq!(out.len(), MERGE_TAKE);
+        let rest = m.take().await.unwrap();
+        assert_eq!(rest.len(), MERGE_TAKE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_merge_follows_a_stream_whose_partner_went_silent() {
+        let (mut m, stx, dtx) = live_merge();
+        stx.send(status_line(100)).await.unwrap();
+        for h in 100..=200 {
+            dtx.send(diff_line(h)).await.unwrap();
+        }
+        let out = taken(&m.take().await.unwrap());
+        assert_eq!(out.last(), Some(&(132, "diffs")));
+
+        // Nothing more from the statuses. The next take waits on them, and
+        // after MERGE_DEAD_WAIT declares them dead and lets the diffs through.
+        let out = taken(&m.take().await.unwrap());
+        assert_eq!(out.first(), Some(&(133, "diffs")));
+        assert!(m.dead[0]);
+
+        // A status arriving revives them and merges as before.
+        stx.send(status_line(190)).await.unwrap();
+        let out = taken(&m.take().await.unwrap());
+        assert!(out.contains(&(190, "orders")));
+        assert!(!m.dead[0]);
+    }
+
+    #[tokio::test]
+    async fn live_merge_does_not_hold_a_stream_before_the_other_has_spoken() {
+        let (mut m, _stx, dtx) = live_merge();
+        for h in 1..=100 {
+            dtx.send(diff_line(h)).await.unwrap();
+        }
+        let out = taken(&m.take().await.unwrap());
+        assert_eq!(out.len(), MERGE_TAKE);
+        assert_eq!(out.first(), Some(&(1, "diffs")));
     }
 }

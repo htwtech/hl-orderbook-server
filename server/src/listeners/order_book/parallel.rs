@@ -19,8 +19,10 @@ use std::{
 /// Message sent from file watcher threads to the main processor
 #[derive(Debug)]
 pub(crate) enum FileEvent {
-    OrderStatus(String),
-    OrderDiff(String),
+    /// A live fill line. Live order-status and book-diff lines do NOT come
+    /// this way: each of those streams has a bounded channel of its own (see
+    /// `LiveStreams`), so the listener can take from whichever is at the lower
+    /// block and a reader that runs ahead simply waits on its full channel.
     Fill(String),
     /// Startup-backfill lines: data that was already on disk when the watcher
     /// started, above the node's persisted height. These are cached for
@@ -82,6 +84,19 @@ const READ_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 /// Long enough for any straggling append to land; a check that came sooner
 /// could pass and the loss go unnoticed.
 const ROTATION_GRACE: Duration = Duration::from_secs(3);
+
+/// Lines a live book stream may have in flight between its reader thread and
+/// the listener. A reader that gets this far ahead of what the listener has
+/// taken from it blocks on the send -- that is the point. Sized for a few
+/// seconds of either stream; the memory behind it is bounded and known.
+pub(crate) const LIVE_STREAM_LINES: usize = 20_000;
+
+/// The live book streams, one bounded channel each, plus the shared channel
+/// for everything else (fills, backfill, control).
+pub(crate) struct LiveStreams {
+    pub statuses: tokio::sync::mpsc::Receiver<String>,
+    pub diffs: tokio::sync::mpsc::Receiver<String>,
+}
 
 /// Wall-clock milliseconds since the unix epoch, for the watcher health
 /// timestamps. (The previous `Instant::now().elapsed()` measured elapsed time
@@ -555,6 +570,7 @@ pub(super) fn spawn_file_watcher(
     last_event: Arc<AtomicU64>,
     backfill_min_height: u64,
     backfills_done: Option<Arc<AtomicU64>>,
+    live_tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> thread::JoinHandle<()> {
     let source_name = match source {
         EventSource::OrderStatuses => "OrderStatuses",
@@ -566,6 +582,15 @@ pub(super) fn spawn_file_watcher(
         info!("{} watcher thread started for {:?}", source_name, dir);
 
         let mut reader = FileReader::new(dir.clone());
+
+        // Where a live line goes: a book stream to its own channel, fills to
+        // the shared one. False once the far end is gone.
+        let send_live = |line: String| -> bool {
+            match &live_tx {
+                Some(live) => live.blocking_send(line).is_ok(),
+                None => tx.blocking_send(FileEvent::Fill(line)).is_ok(),
+            }
+        };
 
         // Create watcher with callback
         let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -656,12 +681,7 @@ pub(super) fn spawn_file_watcher(
                             info!("{} new file: {:?}", source_name, path.file_name());
                             let old_lines = reader.on_create(path);
                             for line in old_lines {
-                                let evt = match source {
-                                    EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                                    EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                                    EventSource::Fills => FileEvent::Fill(line),
-                                };
-                                if tx.blocking_send(evt).is_err() {
+                                if !send_live(line) {
                                     error!("{} channel closed, exiting", source_name);
                                     return;
                                 }
@@ -675,17 +695,10 @@ pub(super) fn spawn_file_watcher(
                         // EVENT-DRIVEN: Read data when inotify fires modify event
                         let lines = reader.on_modify();
                         for line in lines {
-                            let event = match source {
-                                EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                                EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                                EventSource::Fills => FileEvent::Fill(line),
-                            };
-
-                            if tx.blocking_send(event).is_err() {
+                            if !send_live(line) {
                                 error!("{} channel closed, exiting", source_name);
                                 return;
                             }
-
                             // Update health timestamp
                             last_event.store(now_unix_ms(), AtomicOrdering::Relaxed);
                         }
@@ -699,17 +712,10 @@ pub(super) fn spawn_file_watcher(
                     // This runs every 500ms instead of every 10ms
                     let lines = reader.on_modify();
                     for line in lines {
-                        let event = match source {
-                            EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                            EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                            EventSource::Fills => FileEvent::Fill(line),
-                        };
-
-                        if tx.blocking_send(event).is_err() {
+                        if !send_live(line) {
                             error!("{} channel closed, exiting", source_name);
                             return;
                         }
-
                         last_event.store(now_unix_ms(), AtomicOrdering::Relaxed);
                     }
                 }
@@ -754,12 +760,7 @@ pub(super) fn spawn_file_watcher(
                     // Switch to the new file
                     let old_lines = reader.on_create(&newer_file);
                     for line in old_lines {
-                        let evt = match source {
-                            EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                            EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                            EventSource::Fills => FileEvent::Fill(line),
-                        };
-                        if tx.blocking_send(evt).is_err() {
+                        if !send_live(line) {
                             error!("{} channel closed, exiting", source_name);
                             return;
                         }
@@ -781,14 +782,22 @@ pub(super) fn spawn_file_watcher(
 pub(crate) fn start_parallel_file_watchers(
     data_dir: PathBuf,
     backfill_min_height: u64,
-) -> (tokio::sync::mpsc::Receiver<FileEvent>, Vec<thread::JoinHandle<()>>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>)
-{
+) -> (
+    tokio::sync::mpsc::Receiver<FileEvent>,
+    LiveStreams,
+    Vec<thread::JoinHandle<()>>,
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+) {
     // BOUNDED so a slow downstream actually back-pressures the file readers
     // (blocking_send parks until a slot frees up). Under processing stalls an
     // unbounded queue would accumulate multi-KB JSON strings indefinitely - a
     // primary OOM vector; the events sit on disk, no need to mirror them in
     // memory.
     let (tx, rx) = tokio::sync::mpsc::channel(10_000);
+    let (status_tx, status_rx) = tokio::sync::mpsc::channel(LIVE_STREAM_LINES);
+    let (diff_tx, diff_rx) = tokio::sync::mpsc::channel(LIVE_STREAM_LINES);
     let mut handles = Vec::new();
 
     // Health monitoring
@@ -809,12 +818,13 @@ pub(crate) fn start_parallel_file_watchers(
         last_order_status.clone(),
         backfill_min_height,
         Some(backfills_done.clone()),
+        Some(status_tx),
     ));
 
     // Spawn watcher for Fills (no backfill: fills never mutate the book)
     let fills_dir = EventSource::Fills.event_source_dir_streaming(&data_dir);
     info!("Fills dir: {:?}", fills_dir);
-    handles.push(spawn_file_watcher(EventSource::Fills, fills_dir, tx.clone(), last_fills.clone(), 0, None));
+    handles.push(spawn_file_watcher(EventSource::Fills, fills_dir, tx.clone(), last_fills.clone(), 0, None, None));
 
     // Spawn watcher for OrderDiffs
     let order_diffs_dir = EventSource::OrderDiffs.event_source_dir_streaming(&data_dir);
@@ -826,9 +836,10 @@ pub(crate) fn start_parallel_file_watchers(
         last_order_diffs.clone(),
         backfill_min_height,
         Some(backfills_done),
+        Some(diff_tx),
     ));
 
-    (rx, handles, last_order_status, last_fills, last_order_diffs)
+    (rx, LiveStreams { statuses: status_rx, diffs: diff_rx }, handles, last_order_status, last_fills, last_order_diffs)
 }
 
 #[cfg(test)]

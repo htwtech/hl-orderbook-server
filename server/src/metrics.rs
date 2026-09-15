@@ -237,12 +237,12 @@ lazy_static! {
         "Block height of the order-status stream minus that of the book-diff stream"
     ).expect("metric can be created");
 
-    /// Book batches queued by the block-order merge, waiting for the other
-    /// stream to deliver the blocks in between. Zero in steady state; climbs
+    /// Lines waiting in the two live book channels: the readers' lead over
+    /// the listener's block-order merge. Near zero in steady state; climbs
     /// while the readers catch up after a stall, and falls back as they meet.
     pub static ref SKEW_GATE_HELD: IntGauge = IntGauge::new(
         "orderbook_skew_gate_held",
-        "Book-stream batches queued by the block-order merge, waiting for the other stream"
+        "Lines waiting in the two live book channels ahead of the block-order merge"
     ).expect("metric can be created");
 
     /// BBO changes per coin (top 5 tracked individually)
