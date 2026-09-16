@@ -318,8 +318,12 @@ impl OrderBookState {
         });
         let aged_statuses = before - self.pending_order_statuses.len();
         if aged_statuses > 0 {
-            // Expected orphans (order never rested -> no New diff): not data loss.
-            log::info!(
+            // Expected orphans, not data loss: the node writes no book diff
+            // for an order that never rested -- filled or cancelled in the
+            // block it was placed (open -> filled in one block, traced on
+            // mainnet: every one of a sample of 2 507), market orders,
+            // trigger orders. A few a second, so debug, not info.
+            log::debug!(
                 "Evicted {aged_statuses} aged pending_order_statuses entries (no matching BookDiff); e.g. {}",
                 sample.join(", ")
             );
