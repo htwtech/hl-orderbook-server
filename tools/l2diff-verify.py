@@ -11,6 +11,12 @@ Also checks that `prevHeight` chains -- a coin is not dirty at every block, so
 heights skip legitimately and each update must name the one it follows -- and
 reports the byte sizes both channels actually put on the wire.
 
+Frames are paired by `time` AND order: `time` is the block time, and a block
+is applied over several flushes (one every 50 ms, a block takes longer), so
+consecutive frames can carry the same `time` with different content. Both
+channels come out of the same flush, one frame each, in the same order on one
+connection, so the k-th diff at a time pairs with the k-th l2Book at it.
+
 Standard library only, so it runs on the node with nothing installed.
 
   python3 l2diff-verify.py --coin BTC --levels 1000 --seconds 60
@@ -18,6 +24,7 @@ Standard library only, so it runs on the node with nothing installed.
 
 import argparse
 import base64
+import collections
 import json
 import os
 import socket
@@ -175,7 +182,7 @@ def main():
     book = [dict(), dict()]          # reconstructed from the diff stream
     have_snapshot = False
     at_height = None
-    pending = {}                     # time -> book state, awaiting its l2Book frame
+    pending = collections.defaultdict(collections.deque)  # time -> book states, in flush order
 
     snap_bytes, upd_bytes, l2book_bytes = [], [], []
     compared = matched = 0
@@ -208,7 +215,7 @@ def main():
                 have_snapshot = True
                 at_height = d["height"]
                 snap_bytes.append(size)
-                pending[d["time"]] = [dict(book[0]), dict(book[1])]
+                pending[d["time"]].append([dict(book[0]), dict(book[1])])
             else:
                 d = data["Updates"]
                 upd_bytes.append(size)
@@ -222,14 +229,15 @@ def main():
                 apply_side(book[0], d["bids"])
                 apply_side(book[1], d["asks"])
                 at_height = d["height"]
-                pending[d["time"]] = [dict(book[0]), dict(book[1])]
+                pending[d["time"]].append([dict(book[0]), dict(book[1])])
 
         elif chan == "l2Book":
             d = msg["data"]
             l2book_bytes.append(size)
-            mine = pending.pop(d["time"], None)
-            if mine is None:
+            queue = pending.get(d["time"])
+            if not queue:
                 continue
+            mine = queue.popleft()
             theirs = book_from_levels(d["levels"])
             compared += 1
             if mine == theirs:
