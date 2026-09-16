@@ -189,7 +189,7 @@ pub(super) fn get_abci_state_path(config: &SnapshotConfig) -> PathBuf {
 pub(super) fn read_abci_state_height(path: &std::path::Path) -> Option<(u64, Option<String>)> {
     use std::io::Read;
     let mut head = Vec::new();
-    std::fs::File::open(path).ok()?.take(64 * 1024).read_to_end(&mut head).ok()?;
+    fs::File::open(path).ok()?.take(64 * 1024).read_to_end(&mut head).ok()?;
     let mut mp = MsgPack { buf: &head, pos: 0 };
     mp.enter("exchange")?;
     mp.enter("locus")?;
