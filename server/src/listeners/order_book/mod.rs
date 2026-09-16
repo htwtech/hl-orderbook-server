@@ -35,7 +35,7 @@ use tokio::{
     },
     time::{Instant, MissedTickBehavior, interval},
 };
-use utils::{EventBatch, SnapshotConfig, get_visor_path, process_rmp_file, read_visor_height};
+use utils::{EventBatch, SnapshotConfig, get_visor_path, persisted_height, process_rmp_file, read_visor_height};
 
 /// Minimum interval between L2 broadcasts. Caps the broadcast rate at 20/sec; the
 /// conflation buffer accumulates dirty coins between broadcasts.
@@ -61,43 +61,49 @@ mod parallel;
 mod state;
 mod utils;
 
+/// Dump the node's persisted state and install it. Resolves to the height the
+/// dump was cut at: the book streams are applied above it once it is in.
 fn fetch_snapshot(
     snapshot_config: SnapshotConfig,
     listener: Arc<Mutex<OrderBookListener>>,
-    tx: UnboundedSender<Result<()>>,
+    tx: UnboundedSender<Result<u64>>,
     _ignore_spot: bool,
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
         ORDERBOOK_RESYNC_IN_FLIGHT.set(1);
         let total_start = Instant::now();
-        // CRITICAL: Start caching BEFORE generating the snapshot. Every
-        // book-affecting batch that arrives while hl-node dumps state is cached,
-        // and the install replays the ones above the snapshot height - so the
-        // handoff from snapshot to live stream is gapless.
+        // The book streams are held (not applied, not cached) while the
+        // snapshot is fetched: the watchers were started -- or restarted,
+        // for a re-sync -- at the persisted height, and everything from there
+        // to the head is on disk and read from there. So a loss recorded at
+        // or below the head as of now is covered by this install.
+        let covers = read_visor_height(&get_visor_path(&snapshot_config)).unwrap_or(0);
         {
             let mut listener = listener.lock().await;
             listener.begin_caching();
+            listener.install_covers = covers;
         }
 
-        // Read the height BEFORE the dump runs: the dump's content is at least
-        // this fresh, so a replay cutoff at this height can only over-replay
-        // (idempotent - duplicate adds are dropped by the oid guard, cancels of
-        // absent orders no-op). Reading it AFTER the dump over-stated the
-        // cutoff by the whole dump window and silently discarded every cached
-        // add/cancel inside it - permanent anchor holes and phantom orders,
-        // re-seeded at every install.
-        let visor_path = get_visor_path(&snapshot_config);
-        let pre_dump_height = read_visor_height(&visor_path);
+        // The dump is of the persisted state, and the cutoff is that state's
+        // own height, read from its file BEFORE the dump: if the node
+        // persists again in between, the dump is newer and the replay above
+        // the cutoff only over-applies (duplicate adds are dropped by the
+        // oid guard, cancels of absent orders no-op). Reading the visor's
+        // head height here instead cut the replay a persistence period too
+        // high: every event between the persisted state and the head was
+        // discarded as "already in the snapshot" -- hundreds of orders missing
+        // from the book and hundreds cancelled but still in it, on every
+        // install, and nothing counted.
+        let pre_dump_height = persisted_height(&snapshot_config);
 
-        // Now generate snapshot - any events during this time are cached
         let res = match process_rmp_file(&snapshot_config).await {
             Ok(output_fln) => {
                 let snapshot = match pre_dump_height {
                     Some(height) => {
                         load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, height).await
                     }
-                    None => Err("visor state height unavailable before dump".into()),
+                    None => Err("persisted state height unavailable before dump".into()),
                 };
                 info!("Snapshot fetched");
                 match snapshot {
@@ -107,7 +113,9 @@ fn fetch_snapshot(
                         // the replay cache down off-lock, then commit in one
                         // short lock hold - ingest keeps serving the current
                         // book for the whole install.
-                        install_snapshot_phased(&listener, expected_snapshot, untriggered, height).await
+                        install_snapshot_phased(&listener, expected_snapshot, untriggered, height)
+                            .await
+                            .map(|()| height)
                     }
                     Err(err) => Err(err),
                 }
@@ -358,6 +366,10 @@ pub(crate) struct OrderBookListener {
     // snapshot's height (the snapshot source lags the stream), and clearing the
     // flag unconditionally would erase the signal and leave permanent drift.
     max_loss_height: u64,
+    // The head height as of the start of the install in flight: what the
+    // install covers, with the files read from the persisted height up to
+    // it. Consumed by finish_install; 0 means "the snapshot height".
+    install_covers: u64,
     // Highest block height observed on the live stream; the best "now" proxy
     // for bounding losses whose exact height is unknown (watcher discards).
     last_seen_height: u64,
@@ -422,6 +434,7 @@ impl OrderBookListener {
             tolerate_drift: false,
             track_untriggered: true,
             max_loss_height: 0,
+            install_covers: 0,
             last_seen_height: 0,
             stream_height: [0, 0],
             internal_message_tx,
@@ -622,6 +635,11 @@ impl OrderBookListener {
         // keeps the count from being misattributed to the first live batch.
         let replay_fallbacks = new_state.take_insert_before_fallbacks();
         let prior_loss_height = self.max_loss_height;
+        // What this install covers: the head as of its start, when the
+        // watchers were (re)started at the persisted height -- everything up
+        // to it is read from disk after the swap. Tests install without a
+        // fetch and cover the snapshot height alone.
+        let covers = std::mem::replace(&mut self.install_covers, 0).max(height);
         self.order_book_state = Some(new_state);
 
         // A fresh snapshot plus a complete replay is in sync by construction -
@@ -643,9 +661,9 @@ impl OrderBookListener {
         }
         if replay_failed {
             self.mark_desynced("replay_apply_error");
-        } else if prior_loss_height > height {
+        } else if prior_loss_height > covers {
             error!(
-                "Data loss bounded by height {prior_loss_height} is above snapshot height {height}; \
+                "Data loss bounded by height {prior_loss_height} is above what this install covers ({covers}); \
                  keeping re-sync scheduled"
             );
             self.needs_resync = true;
@@ -1056,13 +1074,11 @@ impl OrderBookListener {
         }
     }
 
-    /// Cache a startup-backfill batch for snapshot replay. Backfill batches are
-    /// NEVER applied to a live book: they are older than the live stream by
-    /// construction, and applying e.g. a stale size update on top of newer
-    /// state would corrupt the book. If the replay cache is already gone (the
-    /// snapshot landed before the backfill drained, or the cache overflowed),
-    /// the batch cannot be used safely - mark the book for re-sync instead; the
-    /// re-fetched snapshot's height supersedes everything the backfill carried.
+    /// Cache a batch for snapshot replay without applying it. Production no
+    /// longer does this -- backfill lines wait in the book channels and are
+    /// applied in block order after the install -- but the replay-cache
+    /// semantics it exercises are still those of `cache_for_replay`.
+    #[cfg(test)]
     fn cache_backfill_batch(&mut self, event_batch: EventBatch) {
         if matches!(event_batch, EventBatch::Fills(_)) {
             return;
@@ -1691,6 +1707,10 @@ const MERGE_TAKE: usize = 64;
 /// queued, the skew at 2 400 blocks, both pending caches over their caps.)
 struct LiveMerge {
     rx: [tokio::sync::mpsc::Receiver<String>; 2],
+    /// Batches at or below this height are dropped: the snapshot just
+    /// installed already reflects them. The watchers read from the persisted
+    /// height as of their start; the dump may be one persistence later.
+    floor: u64,
     /// The next parsed batch of each stream, if one has been read ahead.
     peek: [Option<(u64, EventBatch)>; 2],
     /// Highest height taken from each stream.
@@ -1716,6 +1736,7 @@ impl LiveMerge {
     fn new(streams: parallel::LiveStreams) -> Self {
         Self {
             rx: [streams.statuses, streams.diffs],
+            floor: 0,
             peek: [None, None],
             seen: [0, 0],
             dead: [false, false],
@@ -1732,6 +1753,9 @@ impl LiveMerge {
         self.dead[i] = false;
         self.waiting_since = None;
         if let Some(parsed) = parse_event_line(line, Self::source(i)) {
+            if parsed.0 <= self.floor {
+                return;
+            }
             self.peek[i] = Some(parsed);
         }
     }
@@ -1876,13 +1900,12 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         listener.ignore_spot
     };
 
-    // Startup-backfill floor: the node's currently persisted height. The initial
-    // snapshot is generated after this point, so its height is >= the floor and
-    // every line at or below it is already covered by the snapshot. The watchers
-    // backfill on-disk lines above the floor that the old seek-to-EOF behavior
-    // skipped. 0 (visor unreadable) disables the backfill - the snapshot load
-    // would fail on the same file anyway.
-    let backfill_min_height = read_visor_height(&get_visor_path(&snapshot_config)).unwrap_or(0);
+    // Backfill floor: the height of the node's persisted state, what the
+    // initial snapshot is computed from. Everything above it is read from the
+    // node's files and applied, in block order, once the snapshot is in. 0
+    // (neither state file readable) disables the backfill - the snapshot load
+    // would fail on the same files anyway.
+    let backfill_min_height = persisted_height(&snapshot_config).unwrap_or(0);
     info!("Startup backfill floor height: {backfill_min_height}");
 
     // Start parallel file watchers. They send straight into the bounded tokio
@@ -1890,11 +1913,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     // events sit on disk meanwhile). The join handles and health timestamps
     // feed the watchdog in the periodic ticker below - a dead or wedged
     // watcher must not let the server keep serving a silently frozen book.
-    let (mut tokio_rx, live_streams, watcher_handles, last_order_statuses, _last_fills, last_order_diffs) =
-        parallel::start_parallel_file_watchers(dir, backfill_min_height);
+    let (mut tokio_rx, live_streams, mut watcher_handles, mut last_order_statuses, _last_fills, mut last_order_diffs) =
+        parallel::start_parallel_file_watchers(dir.clone(), backfill_min_height);
 
-    // Snapshot fetch channel
-    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
+    // Snapshot fetch channel: resolves to the height the dump was cut at.
+    let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<u64>>();
 
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = tokio::time::interval_at(start, Duration::from_secs(10));
@@ -1921,16 +1944,16 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     /// One parsed watcher event, ready to apply under the listener lock.
     enum Action {
         Apply(u64, EventBatch, EventSource),
-        Backfill(EventBatch),
         Desync,
     }
 
     let mut merge = LiveMerge::new(live_streams);
-
-    // The initial snapshot waits for both book backfills: installing it takes
-    // the replay cache away, and every backfill line still in flight would be
-    // dropped. No backfill means nothing to wait for.
-    let mut backfills_done: [bool; 2] = [backfill_min_height == 0; 2];
+    // The book streams are held until there is a snapshot to apply them to:
+    // at startup, and again during a re-sync, when the watchers are restarted
+    // at the persisted height and the old book is left as it stands. Nothing
+    // is lost meanwhile -- the readers park on their bounded channels and the
+    // lines stay on disk.
+    let mut merge_active = false;
 
     info!("Main event loop starting");
 
@@ -1965,12 +1988,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 // Arrival order is preserved across the batch.
                 let mut actions = Vec::with_capacity(count);
                 for event in event_buf.drain(..) {
-                    let (line, source, is_backfill) = match event {
-                        // Live book lines come through the merge arm below, not
-                        // this channel; fills do, and never touch the book.
-                        parallel::FileEvent::Fill(line) => (line, EventSource::Fills, false),
-                        parallel::FileEvent::BackfillOrderDiff(line) => (line, EventSource::OrderDiffs, true),
-                        parallel::FileEvent::BackfillOrderStatus(line) => (line, EventSource::OrderStatuses, true),
+                    let (line, source) = match event {
+                        // Book lines, backfill and live alike, come through the
+                        // merge arm below, not this channel; fills do, and
+                        // never touch the book.
+                        parallel::FileEvent::Fill(line) => (line, EventSource::Fills),
                         parallel::FileEvent::Desync(source) => {
                             // The watcher discarded data (oversized partial line);
                             // the book can no longer be trusted - trigger a re-sync.
@@ -1979,25 +2001,12 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             continue;
                         }
                         parallel::FileEvent::BackfillDone(source) => {
-                            match source {
-                                EventSource::OrderStatuses => backfills_done[0] = true,
-                                EventSource::OrderDiffs => backfills_done[1] = true,
-                                EventSource::Fills => {}
-                            }
-                            if backfills_done.iter().all(|&d| d) {
-                                info!("Both book backfills complete; the initial snapshot may be installed");
-                            }
+                            info!("{source} backfill delivered; live lines follow it in the same channel");
                             continue;
                         }
                     };
                     if let Some((height, batch)) = parse_event_line(&line, source) {
-                        actions.push(if is_backfill {
-                            // Backfill lines are cache-only: replayed above the
-                            // snapshot height, never applied to a live book.
-                            Action::Backfill(batch)
-                        } else {
-                            Action::Apply(height, batch, source)
-                        });
+                        actions.push(Action::Apply(height, batch, source));
                     }
                 }
                 if !actions.is_empty() {
@@ -2007,7 +2016,6 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     for action in actions {
                         match action {
                             Action::Apply(height, batch, source) => guard.apply_event_batch(height, batch, source),
-                            Action::Backfill(batch) => guard.cache_backfill_batch(batch),
                             Action::Desync => guard.mark_desynced("watcher_data_loss"),
                         }
                     }
@@ -2018,10 +2026,11 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 }
             }
 
-            // The live book streams, in block order across both, up to
-            // MERGE_TAKE per lock acquisition. Waits inside when nothing can be
-            // applied yet, so this arm is only ready with work in hand.
-            taken = merge.take() => {
+            // The book streams, in block order across both, up to MERGE_TAKE
+            // per lock acquisition. Waits inside when nothing can be applied
+            // yet, so this arm is only ready with work in hand. Disabled while
+            // there is no book to apply to (startup, a re-sync in flight).
+            taken = merge.take(), if merge_active => {
                 let Ok(batches) = taken else {
                     return Err("a live book channel closed (its watcher thread exited)".into());
                 };
@@ -2053,7 +2062,14 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             return Err(format!("Abci state reading error: {err}").into());
                         }
                     }
-                    Some(Ok(())) => {}
+                    Some(Ok(height)) => {
+                        // The book streams resume above the snapshot: from the
+                        // persisted height the watchers started at, through
+                        // the hole up to the head, then live.
+                        merge.floor = height;
+                        merge_active = true;
+                        info!("Snapshot installed at height {height}; applying the book streams above it");
+                    }
                 }
                 // Backoff bookkeeping: converged installs reset the spacing,
                 // anything else (fetch error, or an install that re-marked
@@ -2099,11 +2115,32 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                 // an urgent desync (data loss, fallback burst, or a fallback
                 // that waited out the coalescing window) AND the backoff
                 // spacing to have elapsed.
-                let backfill_ready = backfills_done.iter().all(|&d| d);
-                let fetch_due = (!is_ready && backfill_ready)
-                    || (needs_resync && resync_urgent && Instant::now() >= next_fetch_allowed);
+                let fetch_due =
+                    !is_ready || (needs_resync && resync_urgent && Instant::now() >= next_fetch_allowed);
                 if fetch_due && !snapshot_fetch_pending {
                     snapshot_fetch_pending = true;
+                    if is_ready {
+                        // A re-sync. The dump will be of the persisted state,
+                        // up to a persistence period behind the head, and the
+                        // events between the two were applied to the old book
+                        // long ago -- they are on disk, in no cache. Read them
+                        // again: fresh watchers backfill from the persisted
+                        // height, the streams are held until the new book is
+                        // in, and the old watchers exit on their next send.
+                        let floor = persisted_height(&snapshot_config).unwrap_or(0);
+                        let (rx, streams, handles, statuses_seen, _fills_seen, diffs_seen) =
+                            parallel::start_parallel_file_watchers(dir.clone(), floor);
+                        tokio_rx = rx;
+                        merge = LiveMerge::new(streams);
+                        watcher_handles = handles;
+                        last_order_statuses = statuses_seen;
+                        last_order_diffs = diffs_seen;
+                        merge_active = false;
+                        info!(
+                            "Re-sync: watchers restarted at the persisted height {floor}; \
+                             the book stands still until the new snapshot is installed"
+                        );
+                    }
                     let listener = listener.clone();
                     let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                     fetch_snapshot(snapshot_config.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
@@ -3158,6 +3195,26 @@ mod tests {
     /// (height, stream) of what the merge handed out.
     fn taken(out: &[(u64, EventBatch, EventSource)]) -> Vec<(u64, &'static str)> {
         out.iter().map(|(h, _, s)| (*h, s.metric_label())).collect()
+    }
+
+    #[tokio::test]
+    async fn live_merge_drops_what_the_snapshot_already_holds() {
+        // Watchers started at the persisted height 100; the dump turned out to
+        // be one persistence later, at 105. Everything at or below 105 is in
+        // the snapshot and must not be applied on top of it.
+        let (mut m, stx, dtx) = live_merge();
+        m.floor = 105;
+        for h in 101..=108 {
+            stx.send(status_line(h)).await.unwrap();
+            dtx.send(diff_line(h)).await.unwrap();
+        }
+        let out = taken(&m.take().await.unwrap());
+        let mut expect = Vec::new();
+        for h in 106..=108 {
+            expect.push((h, "orders"));
+            expect.push((h, "diffs"));
+        }
+        assert_eq!(out, expect);
     }
 
     #[tokio::test]

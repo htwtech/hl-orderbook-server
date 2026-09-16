@@ -24,20 +24,11 @@ pub(crate) enum FileEvent {
     /// `LiveStreams`), so the listener can take from whichever is at the lower
     /// block and a reader that runs ahead simply waits on its full channel.
     Fill(String),
-    /// Startup-backfill lines: data that was already on disk when the watcher
-    /// started, above the node's persisted height. These are cached for
-    /// snapshot replay but NEVER applied to a live book - they are older than
-    /// the live stream, and applying e.g. a stale size update out of order
-    /// would corrupt the book.
-    BackfillOrderStatus(String),
-    BackfillOrderDiff(String),
     /// The watcher had to discard buffered data (oversized partial line). The
     /// book may have missed events and must be re-synced from a snapshot.
     Desync(EventSource),
-    /// This source's startup backfill has been sent in full. The initial
-    /// snapshot must not be installed before both book sources have said so:
-    /// an install takes the replay cache away, and backfill lines arriving
-    /// after that were dropped -- 62 457 of them on one start.
+    /// This source's backfill -- the lines already on disk above the floor --
+    /// has been sent in full, into its book channel ahead of the live lines.
     BackfillDone(EventSource),
 }
 
@@ -179,17 +170,16 @@ impl FileReader {
         files
     }
 
-    /// One-shot startup backfill. Streams (oldest-first) every complete line
-    /// already on disk whose block height exceeds `min_height`, then positions
-    /// live tracking exactly at the backfill cut so no line is skipped or read
+    /// One-shot backfill. Streams (oldest-first) every complete line already
+    /// on disk whose block height exceeds `min_height`, then positions live
+    /// tracking exactly at the backfill cut so no line is skipped or read
     /// twice. Returns false if `emit` reported a closed channel.
     ///
-    /// This closes the startup drift window: the old behavior seeked straight
-    /// to EOF, so lines written between the node's last persisted state (what
-    /// the initial snapshot is computed from) and watcher start were never read
-    /// at all. The snapshot height is always >= the node's persisted height at
-    /// boot, so filtering by `min_height` (that persisted height) over-covers;
-    /// the replay in init_from_snapshot then filters exactly by snapshot height.
+    /// This closes the drift window between the node's persisted state (what
+    /// a snapshot is computed from) and the head: `min_height` is the
+    /// persisted height, read from the state file itself, and the snapshot
+    /// installed later is at least that fresh, so reading from here
+    /// over-covers; the merge then drops what is at or below the snapshot.
     fn backfill_and_track(&mut self, min_height: u64, emit: &mut dyn FnMut(String) -> bool) -> bool {
         /// More candidate files than this means the snapshot source lags hours
         /// behind the stream - bail out and let the desync re-sync loop surface
@@ -609,24 +599,21 @@ pub(super) fn spawn_file_watcher(
             return;
         }
 
-        // One-shot startup backfill: stream lines already on disk above the
-        // height floor (everything at/below it is covered by the initial
-        // snapshot), wrapped in Backfill* variants so the listener caches them
-        // for snapshot replay without applying them to a live book. Fills are
-        // excluded: they never mutate the book and are not replayed. Runs after
-        // watch() so appends racing the backfill are still notified; ordering
-        // per source is preserved because backfill lines enter the channel
-        // before any live line.
+        // One-shot backfill: stream the lines already on disk above the
+        // height floor -- the node's persisted height, what the snapshot is
+        // computed from -- into the book channel, ahead of the live lines.
+        // The listener holds the channel until the snapshot is installed and
+        // then applies everything in block order; until then the reader
+        // simply parks on the bounded channel, and the lines stay on disk.
+        // (They used to be cached, parsed, in memory: with the floor at the
+        // persisted height that is up to twelve minutes of the stream.) Fills
+        // are excluded: they never mutate the book. Runs after watch() so
+        // appends racing the backfill are still notified.
         if backfill_min_height > 0 && !matches!(source, EventSource::Fills) {
             let mut sent = 0_usize;
             let channel_open = reader.backfill_and_track(backfill_min_height, &mut |line| {
-                let evt = match source {
-                    EventSource::OrderStatuses => FileEvent::BackfillOrderStatus(line),
-                    EventSource::OrderDiffs => FileEvent::BackfillOrderDiff(line),
-                    EventSource::Fills => unreachable!("fills are excluded from backfill"),
-                };
                 sent += 1;
-                tx.blocking_send(evt).is_ok()
+                send_live(line)
             });
             if !channel_open {
                 error!("{source_name} channel closed during backfill, exiting");
@@ -773,8 +760,10 @@ pub(super) fn spawn_file_watcher(
 
 /// Start all 3 file watcher threads, returns receiver for events
 /// Uses *_streaming directories (for --stream-with-block-info mode)
-/// `backfill_min_height` is the startup backfill floor (the node's persisted
-/// height at boot); 0 disables the backfill.
+/// `backfill_min_height` is the backfill floor (the node's persisted height,
+/// what the snapshot about to be installed is computed from); 0 disables the
+/// backfill. Called again for a re-sync: the old watchers exit once their
+/// channels are dropped, the new ones read from the floor.
 ///
 /// The watcher threads send straight into a tokio mpsc via `blocking_send` -
 /// the old crossbeam channel + spawn_blocking bridge added a thread and a

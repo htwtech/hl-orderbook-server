@@ -154,17 +154,194 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
     Err("Snapshot file not created".into())
 }
 
-/// Current node height from `visor_abci_state.json`, or None if unreadable.
-/// Read BEFORE a dump is generated, it is a lower bound of the dump's content
-/// height (heights only advance), which makes it safe for both of its uses:
-/// as the startup-backfill floor (every line at or below it is covered by the
-/// snapshot) and as the replay cutoff (replaying events above it can only
-/// over-apply idempotently, never skip events the snapshot lacks). Reading it
-/// AFTER the dump would over-state the cutoff by the whole dump window.
+/// The node's head height from `visor_abci_state.json`, or None if unreadable.
+/// This is where the node IS, not what its persisted state is at: the file
+/// tracks the head block by block, while `abci_state.rmp` -- what the L4 dump
+/// is computed from -- is rewritten every 10 000 blocks. See
+/// [`read_abci_state_height`] for the snapshot's own height.
 pub(super) fn read_visor_height(visor_path: &std::path::Path) -> Option<u64> {
     let contents = fs::read_to_string(visor_path).ok()?;
     let visor: serde_json::Value = serde_json::from_str(&contents).ok()?;
     visor["height"].as_u64()
+}
+
+/// Where the node keeps its persisted state, `abci_state.rmp`: the file the
+/// L4 dump is computed from. The same default as the direct snapshot mode;
+/// in docker mode it is the host side of the container's `hl/` mount.
+pub(super) fn get_abci_state_path(config: &SnapshotConfig) -> PathBuf {
+    config.abci_state_path.clone().unwrap_or_else(|| {
+        let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
+        parent_dir.join("hyperliquid_data/abci_state.rmp")
+    })
+}
+
+/// The height (and block time) of the node's persisted state, read from the
+/// first bytes of `abci_state.rmp` itself: MessagePack, a map whose
+/// `exchange.locus.ctx` carries `height` and `time`.
+///
+/// This is the height the L4 dump is at -- not the one in
+/// `visor_abci_state.json`. The node persists its state every 10 000 blocks
+/// (some twelve minutes) and the visor file tracks the head, so the two are
+/// up to a persistence period apart. Cutting the replay at the visor height
+/// threw away every event between the persisted state and the head: orders
+/// placed in that window were missing from the book and orders cancelled in
+/// it stayed, hundreds of each on every start, and nothing warned.
+pub(super) fn read_abci_state_height(path: &std::path::Path) -> Option<(u64, Option<String>)> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path).ok()?.take(64 * 1024).read_to_end(&mut head).ok()?;
+    let mut mp = MsgPack { buf: &head, pos: 0 };
+    mp.enter("exchange")?;
+    mp.enter("locus")?;
+    mp.enter("ctx")?;
+    let entries = mp.map_len()?;
+    let (mut height, mut time) = (None, None);
+    for _ in 0..entries {
+        let Some(key) = mp.str() else { break };
+        let read = match key {
+            "height" => mp.uint().map(|h| height = Some(h)),
+            "time" => mp.str().map(|t| time = Some(t.to_string())),
+            _ => mp.skip(),
+        };
+        if read.is_none() || (height.is_some() && time.is_some()) {
+            break;
+        }
+    }
+    height.map(|h| (h, time))
+}
+
+/// The height the node's files are read from and replayed above: the
+/// persisted state's, from the rmp itself. The visor's head height only when
+/// the rmp cannot be read -- with the hole that leaves named in the log.
+pub(super) fn persisted_height(config: &SnapshotConfig) -> Option<u64> {
+    let rmp = get_abci_state_path(config);
+    let head = read_visor_height(&get_visor_path(config));
+    match read_abci_state_height(&rmp) {
+        Some((height, time)) => {
+            info!(
+                "Persisted state {} is at height {height} ({}), {} blocks behind the head",
+                rmp.display(),
+                time.as_deref().unwrap_or("time unknown"),
+                head.map_or_else(|| "?".to_string(), |h| h.saturating_sub(height).to_string())
+            );
+            Some(height)
+        }
+        None => {
+            log::warn!(
+                "Cannot read the persisted state height from {}; using the visor head height {head:?} instead: \
+                 up to one persistence period of events below it will be missing from the book",
+                rmp.display()
+            );
+            head
+        }
+    }
+}
+
+/// A cursor over a MessagePack prefix: enough of the format to walk map keys
+/// and step over the values that are not wanted. Running out of bytes is
+/// `None`, like any malformed input.
+struct MsgPack<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> MsgPack<'a> {
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.buf.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.buf.get(self.pos..self.pos.checked_add(n)?)?;
+        self.pos += n;
+        Some(s)
+    }
+
+    /// A big-endian unsigned integer of `n` bytes.
+    fn be(&mut self, n: usize) -> Option<u64> {
+        Some(self.bytes(n)?.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b)))
+    }
+
+    /// A map header: its number of entries.
+    fn map_len(&mut self) -> Option<usize> {
+        match self.byte()? {
+            m @ 0x80..=0x8f => Some(usize::from(m & 0x0f)),
+            0xde => self.be(2).map(|n| n as usize),
+            0xdf => self.be(4).map(|n| n as usize),
+            _ => None,
+        }
+    }
+
+    fn str(&mut self) -> Option<&'a str> {
+        let len = match self.byte()? {
+            m @ 0xa0..=0xbf => usize::from(m & 0x1f),
+            0xd9 => self.be(1)? as usize,
+            0xda => self.be(2)? as usize,
+            0xdb => self.be(4)? as usize,
+            _ => return None,
+        };
+        std::str::from_utf8(self.bytes(len)?).ok()
+    }
+
+    fn uint(&mut self) -> Option<u64> {
+        match self.byte()? {
+            m @ 0x00..=0x7f => Some(u64::from(m)),
+            0xcc => self.be(1),
+            0xcd => self.be(2),
+            0xce => self.be(4),
+            0xcf => self.be(8),
+            _ => None,
+        }
+    }
+
+    /// Step over one value of any type.
+    fn skip(&mut self) -> Option<()> {
+        let m = self.byte()?;
+        let (payload, items) = match m {
+            0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => (0, 0),
+            0x80..=0x8f => (0, 2 * usize::from(m & 0x0f)),
+            0x90..=0x9f => (0, usize::from(m & 0x0f)),
+            0xa0..=0xbf => (usize::from(m & 0x1f), 0),
+            0xc4 | 0xd9 => (self.be(1)? as usize, 0),
+            0xc5 | 0xda => (self.be(2)? as usize, 0),
+            0xc6 | 0xdb => (self.be(4)? as usize, 0),
+            0xc7 => (self.be(1)? as usize + 1, 0),
+            0xc8 => (self.be(2)? as usize + 1, 0),
+            0xc9 => (self.be(4)? as usize + 1, 0),
+            0xcc | 0xd0 => (1, 0),
+            0xcd | 0xd1 => (2, 0),
+            0xca | 0xce | 0xd2 => (4, 0),
+            0xcb | 0xcf | 0xd3 => (8, 0),
+            0xd4 => (2, 0),
+            0xd5 => (3, 0),
+            0xd6 => (5, 0),
+            0xd7 => (9, 0),
+            0xd8 => (17, 0),
+            0xdc => (0, self.be(2)? as usize),
+            0xdd => (0, self.be(4)? as usize),
+            0xde => (0, 2 * self.be(2)? as usize),
+            0xdf => (0, 2 * self.be(4)? as usize),
+            0xc1 => return None,
+        };
+        self.bytes(payload)?;
+        for _ in 0..items {
+            self.skip()?;
+        }
+        Some(())
+    }
+
+    /// Into the value of `key` in the map that starts here, stepping over the
+    /// other entries. None when the key is not in it.
+    fn enter(&mut self, key: &str) -> Option<()> {
+        for _ in 0..self.map_len()? {
+            if self.str()? == key {
+                return Some(());
+            }
+            self.skip()?;
+        }
+        None
+    }
 }
 
 /// Get the visor state path based on config
@@ -326,7 +503,7 @@ mod tests {
         types::inner::InnerL4Order,
     };
     use alloy::primitives::Address;
-    use std::collections::HashSet;
+    use std::{collections::HashSet, path::PathBuf};
 
     fn order(oid: u64, coin: &str, side: Side, sz: &str, px: &str) -> InnerL4Order {
         InnerL4Order {
@@ -686,5 +863,83 @@ mod tests {
                 "variant must match the all-variants build"
             );
         }
+    }
+
+    // ==================== Persisted state height ====================
+
+    /// The first 146 bytes of a mainnet abci_state.rmp, as found on disk:
+    /// {"exchange": {"locus": {"ctx": {"hardfork_height", "hardfork": {..},
+    /// "height": 1149510000, "tx_index", "round", "time": "2026-09-16T...", ...
+    fn abci_state_head() -> Vec<u8> {
+        let hex = "81a86578636861 6e6765de003ba56c6f637573de0011a3637478 8daf68617264666f726b5f686569676874ce 444cf858\
+                   a8686172 64666f726b82a776657273696f6e68a5726f756e64ce563d9c40 a6686569676874ce44842170 a874785f696e646578 0a\
+                   a5726f756e64ce5678470e a474696d65bd323032362d30392d31365430383a33363a34322e313030333338303634";
+        let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn write_temp(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("obs_{}_{}", std::process::id(), name));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn persisted_height_is_read_from_the_rmp_header() {
+        let path = write_temp("abci_state.rmp", &abci_state_head());
+        let (height, time) = read_abci_state_height(&path).expect("header parses");
+        assert_eq!(height, 1_149_510_000);
+        assert_eq!(time.as_deref(), Some("2026-09-16T08:36:42.100338064"));
+    }
+
+    #[test]
+    fn persisted_height_survives_a_header_cut_after_the_height() {
+        // The height comes before the time; a prefix that ends between them
+        // still yields the height, without the time.
+        let head = abci_state_head();
+        let cut = head.len() - 40;
+        let path = write_temp("abci_state_cut.rmp", &head[..cut]);
+        let (height, time) = read_abci_state_height(&path).expect("height is before the cut");
+        assert_eq!(height, 1_149_510_000);
+        assert_eq!(time, None);
+    }
+
+    #[test]
+    fn persisted_height_is_none_without_the_expected_keys() {
+        // A map with other keys, and a non-map: neither has exchange.locus.ctx.
+        let path = write_temp("abci_state_other.rmp", &[0x81, 0xa3, b'f', b'o', b'o', 0x01]);
+        assert_eq!(read_abci_state_height(&path), None);
+        let path = write_temp("abci_state_num.rmp", &[0xce, 0x44, 0x84, 0x21, 0x70]);
+        assert_eq!(read_abci_state_height(&path), None);
+        assert_eq!(read_abci_state_height(std::path::Path::new("/nonexistent/abci_state.rmp")), None);
+    }
+
+    #[test]
+    fn msgpack_skip_steps_over_every_shape() {
+        // A map of one wanted key after values of every kind: nil, bool,
+        // fixint, u16, i32, f64, fixstr, str8, bin8, fixext1, fixarray of two,
+        // fixmap of one. Skipping each lands exactly on the next key.
+        let mut buf = vec![0x8d];
+        let mut kv = |key: &str, value: &[u8]| {
+            buf.push(0xa0 | key.len() as u8);
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(value);
+        };
+        kv("a", &[0xc0]);
+        kv("b", &[0xc3]);
+        kv("c", &[0x2a]);
+        kv("d", &[0xcd, 0x12, 0x34]);
+        kv("e", &[0xd2, 0xff, 0xff, 0xff, 0xfe]);
+        kv("f", &[0xcb, 0, 0, 0, 0, 0, 0, 0, 0]);
+        kv("g", &[0xa2, b'h', b'i']);
+        kv("h", &[0xd9, 0x03, b'x', b'y', b'z']);
+        kv("i", &[0xc4, 0x02, 0xde, 0xad]);
+        kv("j", &[0xd4, 0x01, 0x07]);
+        kv("k", &[0x92, 0x01, 0xa1, b'q']);
+        kv("l", &[0x81, 0xa1, b'z', 0x05]);
+        kv("height", &[0xce, 0x44, 0x84, 0x21, 0x70]);
+        let mut mp = MsgPack { buf: &buf, pos: 0 };
+        mp.enter("height").expect("every value before it is skipped cleanly");
+        assert_eq!(mp.uint(), Some(1_149_510_000));
     }
 }

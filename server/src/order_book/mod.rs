@@ -114,7 +114,16 @@ impl<O: InnerOrder> OrderBook<O> {
         // to re-run matching, which would double-count the match against opposite-side
         // orders that have arrived since.)
         if self.oid_to_side_px.contains_key(&order.oid()) {
-            log::warn!("OrderBook::add_order called twice for oid={:?}; ignoring duplicate", order.oid());
+            // Sampled: a replay that starts one node persistence below the
+            // snapshot re-adds every order of that window, thousands at once.
+            static DUPLICATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = DUPLICATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 1000 == 0 {
+                log::warn!(
+                    "OrderBook::add_order called twice for oid={:?}; ignoring duplicate (#{n}, logged 1/1000)",
+                    order.oid()
+                );
+            }
             return false;
         }
         let (maker_orders, resting_book) = match order.side() {
