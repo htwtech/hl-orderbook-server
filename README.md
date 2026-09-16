@@ -388,6 +388,8 @@ The Hyperliquid node must run with **all** of these flags enabled:
 
 ### Consistency (no-drift) guarantees
 
+How these were found, measured and verified -- and what is still open -- is written up in [docs/CONSISTENCY.md](docs/CONSISTENCY.md).
+
 The in-memory book is kept consistent with the node through three layers:
 
 1. **Backfill from the persisted height** - around every snapshot, at boot and at re-sync, the watchers read the streaming files from the height of the node's persisted state (read from `abci_state.rmp` itself; `visor_abci_state.json` holds the head, up to 10 000 blocks ahead of it), so nothing written between the state the snapshot was computed from and the server's start is skipped.
