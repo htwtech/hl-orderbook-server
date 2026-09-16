@@ -166,6 +166,8 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
         res
     }
 
+    /// Only the debug-build aggregate check and the tests walk the list this way.
+    #[cfg(any(debug_assertions, test))]
     pub(crate) fn fold<F, Acc>(&self, mut init: Acc, f: F) -> Acc
     where
         F: Fn(&mut Acc, &T),

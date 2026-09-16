@@ -712,7 +712,7 @@ impl OrderBookListener {
     pub(crate) fn compute_untriggered_snapshot(
         &self,
         coin: Option<&Coin>,
-    ) -> Option<(u64, u64, Vec<std::sync::Arc<InnerL4Order>>)> {
+    ) -> Option<(u64, u64, Vec<Arc<InnerL4Order>>)> {
         self.order_book_state.as_ref().map(|state| state.untriggered_snapshot(coin))
     }
 }
@@ -1452,7 +1452,10 @@ impl L2Snapshots {
     }
 }
 
-// Messages sent from node data listener to websocket dispatch to support streaming
+// Messages sent from node data listener to websocket dispatch to support streaming.
+// Always handed around as Arc<InternalMessage>, so the size of the Snapshot
+// variant is paid once per flush, not per copy.
+#[allow(variant_size_differences)]
 pub(crate) enum InternalMessage {
     Snapshot {
         l2_snapshots: L2Snapshots,
