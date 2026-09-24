@@ -12,6 +12,7 @@ Real-time orderbook data from a local Hyperliquid node:
 
 - **bbo** - Best Bid/Offer (top of book) with deduplication
 - **l2Book** - Aggregated Level 2 orderbook with deduplication
+- **l2Diff** - The same book as one snapshot then only what changed (~100x less traffic at depth; see [docs/L2DIFF.md](docs/L2DIFF.md))
 - **trades** - Real-time trade feed
 - **bookDiffs** - Raw book diff stream per coin
 - **l4Book** - Full Level 4 orderbook with individual order details (price-banded one-shot reads via `GET /l4Book`)
@@ -260,9 +261,17 @@ Streams raw order book diffs as they arrive. Each diff is one of: `new` (order a
 ```json
 { "method": "subscribe", "subscription": { "type": "l2Book", "coin": "BTC" } }
 ```
-Optional parameters: `nSigFigs` (2-5), `nLevels` (max 100, default 20), `mantissa` (2 or 5)
+Optional parameters: `nSigFigs` (2-5), `nLevels` (max 1000, default 20 — pass `null`, not `20`, for the default), `mantissa` (2 or 5, requires `nSigFigs: 5`)
 
 Aggregation matches HL's public API semantics: the **full** book is bucketed by `nSigFigs`/`mantissa` first, then truncated to `nLevels` aggregated buckets — so coarse groupings (e.g. `nSigFigs: 2`) return deep ladders spanning far from the mid, not just the near-mid raw levels.
+
+### Subscribe to L2 Diff
+```json
+{ "method": "subscribe", "subscription": { "type": "l2Diff", "coin": "BTC", "nLevels": 1000 } }
+```
+The same book and the same parameters as `l2Book`, sent as one `Snapshot` followed by `Updates` carrying only the levels that changed (`upd` as `[px, sz, n]` triples, `del` as prices). At 1000 levels that measured **113x less traffic over a 120 s run** (1.06 MB vs 120.04 MB), with the rebuilt book identical to every `l2Book` frame.
+
+Apply `upd` as an upsert by price and `del` as a removal; check `prevHeight` against the last `height` you applied — heights skip legitimately, so that field, not `height - 1`, is the continuity check. Full reference: **[docs/L2DIFF.md](docs/L2DIFF.md)**.
 
 ### Subscribe to L4 Orderbook
 ```json
